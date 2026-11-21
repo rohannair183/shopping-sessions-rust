@@ -51,3 +51,5 @@ The local runner defaults to six pinned vCPUs and 8 GiB without swap. It runs th
 Both tables matched all 36 official fixtures. The public million-event run matched all 117,038 shopper rows and 27,400 campaign rows, including schema and values. The comparator found no missing rows, extra rows, or duplicate keys.
 
 On the local seed-7 practice dataset, the original program took 12.98 seconds, compact event IDs alone took 10.48 seconds, and both ID changes took 7.73 seconds. Each number is the median of three runs on six pinned Docker CPUs with an 8 GiB limit. The timer covers the program through writing both reports and excludes Docker startup. All 2,242,393 shopper rows and 28,014 campaign rows matched the original practice output.
+
+The [follow-up profile](docs/performance-profile.md) breaks down the remaining costs after the compact ID changes and compares four further optimizations.

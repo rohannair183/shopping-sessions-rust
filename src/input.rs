@@ -130,10 +130,61 @@ struct Candidate {
     payload: Option<OwnedEvent>,
 }
 
-fn shard(key: &str, count: usize) -> usize {
-    let mut h = DefaultHasher::new();
-    key.hash(&mut h);
-    h.finish() as usize % count
+// SplitMix64's finalizer spreads the eight ID bytes across the shard and filter bits.
+fn mix_id(mut key: u64) -> u64 {
+    key = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    key = (key ^ (key >> 27)).wrapping_mul(0x94d049bb133111eb);
+    key ^ (key >> 31)
+}
+
+impl EventId {
+    fn shard(&self, count: usize) -> usize {
+        let hash = match self {
+            Self::Short(key) => mix_id(*key),
+            Self::Text(text) => {
+                let mut h = DefaultHasher::new();
+                text.hash(&mut h);
+                h.finish()
+            }
+        };
+        hash as usize % count
+    }
+}
+
+// A slot records whether it was visited once or more than once. A collision
+// sends every ID in the slot to the exact map; it never discards an event.
+struct RepeatFilter {
+    words: Vec<(u64, u64)>,
+}
+
+impl RepeatFilter {
+    fn new(rows: usize) -> Self {
+        const SLOTS_PER_ROW: usize = 8;
+        let rows_per_word = u64::BITS as usize / SLOTS_PER_ROW;
+        let words = rows.div_ceil(rows_per_word).next_power_of_two();
+        Self {
+            words: vec![(0, 0); words],
+        }
+    }
+
+    fn slot(&self, key: u64) -> (usize, u64) {
+        // Choose bits away from the low bits used to select the shard.
+        let hash = mix_id(key).rotate_right(32);
+        let word = (hash >> 6) as usize & (self.words.len() - 1);
+        (word, 1 << (hash & 63))
+    }
+
+    fn record(&mut self, key: u64) {
+        let (word, bit) = self.slot(key);
+        let (seen, repeated) = &mut self.words[word];
+        *repeated |= *seen & bit;
+        *seen |= bit;
+    }
+
+    fn might_repeat(&self, key: u64) -> bool {
+        let (word, bit) = self.slot(key);
+        self.words[word].1 & bit != 0
+    }
 }
 fn buckets<T>(n: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::new()).collect()
@@ -150,6 +201,38 @@ fn regroup<T>(batches: Batches<T>, count: usize) -> Batches<T> {
         }
     }
     groups
+}
+
+fn deduplicate(parts: Vec<Vec<Candidate>>, count: usize) -> Vec<Vec<OwnedEvent>> {
+    let mut filter = RepeatFilter::new(parts.iter().map(Vec::len).sum());
+    for c in parts.iter().flatten() {
+        if let EventId::Short(key) = c.id {
+            filter.record(key);
+        }
+    }
+    let mut earliest = HashMap::new();
+    let mut out = buckets(count);
+    let mut emit = |payload: Option<OwnedEvent>| {
+        if let Some((person, event)) = payload {
+            out[person % count].push((person, event));
+        }
+    };
+    for c in parts.into_iter().flatten() {
+        if let EventId::Short(key) = c.id
+            && !filter.might_repeat(key)
+        {
+            emit(c.payload);
+            continue;
+        }
+        let slot = earliest.entry(c.id).or_insert((i64::MAX, None));
+        if c.ingest < slot.0 {
+            *slot = (c.ingest, c.payload);
+        }
+    }
+    for (_, payload) in earliest.into_values() {
+        emit(payload);
+    }
+    out
 }
 
 pub fn events(
@@ -176,8 +259,9 @@ pub fn events(
                 let payload = refs
                     .event(&row, ingest)
                     .map(|event| (people.resolve(row[1]), event));
-                out[shard(row[0], count)].push(Candidate {
-                    id: row[0].into(),
+                let id = EventId::from(row[0]);
+                out[id.shard(count)].push(Candidate {
+                    id,
                     ingest,
                     payload,
                 });
@@ -187,22 +271,7 @@ pub fn events(
         .collect::<io::Result<_>>()?;
     let winners = regroup(batches, count)
         .into_par_iter()
-        .map(|parts| {
-            let mut earliest = HashMap::new();
-            for c in parts.into_iter().flatten() {
-                let slot = earliest.entry(c.id).or_insert((i64::MAX, None));
-                if c.ingest < slot.0 {
-                    *slot = (c.ingest, c.payload);
-                }
-            }
-            let mut out = buckets(count);
-            for (_, (_, p)) in earliest {
-                if let Some((person, event)) = p {
-                    out[person % count].push((person, event));
-                }
-            }
-            out
-        })
+        .map(|parts| deduplicate(parts, count))
         .collect();
     Ok(regroup(winners, count))
 }
@@ -249,7 +318,7 @@ pub fn clicks(
 
 #[cfg(test)]
 mod tests {
-    use super::EventId;
+    use super::{Candidate, Event, EventId, RepeatFilter, deduplicate};
     use std::collections::HashSet;
 
     #[test]
@@ -266,5 +335,46 @@ mod tests {
         ];
         let keys: HashSet<_> = ids.into_iter().map(EventId::from).collect();
         assert_eq!(keys.len(), 7);
+    }
+
+    #[test]
+    fn collisions_keep_distinct_ids_and_invalid_early_copies_win_across_batches() {
+        let filter = RepeatFilter::new(6);
+        let colliding = (1..)
+            .find(|&key| filter.slot(key) == filter.slot(0))
+            .unwrap();
+        let candidate = |id, ingest, shopper: Option<usize>| Candidate {
+            id,
+            ingest,
+            payload: shopper.map(|person| {
+                (
+                    person,
+                    Event {
+                        ts: 0,
+                        cents: 0,
+                        category: 0,
+                    },
+                )
+            }),
+        };
+        let parts = vec![
+            vec![
+                candidate(EventId::Short(0), 2, Some(10)),
+                candidate(EventId::Short(colliding), 1, Some(20)),
+                candidate(EventId::from("long event ID"), 3, Some(30)),
+            ],
+            vec![
+                candidate(EventId::Short(0), 1, None),
+                candidate(EventId::from("long event ID"), 2, Some(40)),
+                candidate(EventId::Short(1 + colliding), 1, Some(50)),
+            ],
+        ];
+        let mut people: Vec<_> = deduplicate(parts, 3)
+            .into_iter()
+            .flatten()
+            .map(|(person, _)| person)
+            .collect();
+        people.sort_unstable();
+        assert_eq!(people, [20, 40, 50]);
     }
 }
