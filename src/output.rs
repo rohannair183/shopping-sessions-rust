@@ -1,8 +1,9 @@
 use crate::{
     Result,
+    campaign::CampaignRow,
     identity::Names,
     input::Lookups,
-    model::{CampaignDays, UserRow},
+    model::{Person, UserRow},
 };
 use parquet::{
     data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type},
@@ -29,7 +30,7 @@ fn table<T>(
     path: &Path,
     schema: &str,
     rows: &[T],
-    columns: impl Fn(&[T]) -> Vec<Column>,
+    mut columns: impl FnMut(&[T]) -> Vec<Column>,
 ) -> Result<()> {
     let file = File::create_new(path)?;
     let mut writer = SerializedFileWriter::new(
@@ -64,11 +65,22 @@ fn table<T>(
 }
 
 pub fn users(path: &Path, rows: &[UserRow], refs: &Lookups, names: &Names) -> Result<()> {
+    // A shopper's daily rows are consecutive and can span Parquet row groups.
+    let mut previous: Option<(Person, ByteArray)> = None;
     table(path, USER, rows, |b| {
         vec![
             Column::Text(
                 b.iter()
-                    .map(|r| names.with_name(r.person, |name| ByteArray::from(name)))
+                    .map(|r| {
+                        if let Some((person, name)) = &previous
+                            && *person == r.person
+                        {
+                            return name.clone();
+                        }
+                        let name = names.with_name(r.person, |name| ByteArray::from(name));
+                        previous = Some((r.person, name.clone()));
+                        name
+                    })
                     .collect(),
                 None,
             ),
@@ -86,9 +98,8 @@ pub fn users(path: &Path, rows: &[UserRow], refs: &Lookups, names: &Names) -> Re
     })
 }
 
-pub fn campaigns(path: &Path, rows: CampaignDays, refs: &Lookups) -> Result<()> {
-    let rows: Vec<_> = rows.into_iter().collect();
-    table(path, CAMPAIGN, &rows, |b| {
+pub fn campaigns(path: &Path, rows: &[CampaignRow], refs: &Lookups) -> Result<()> {
+    table(path, CAMPAIGN, rows, |b| {
         vec![
             Column::Text(
                 b.iter()

@@ -55,3 +55,5 @@ On the local seed-7 practice dataset, the original program took 12.98 seconds, c
 The [follow-up profile](docs/performance-profile.md) breaks down the remaining costs after the compact ID changes and compares four further optimizations.
 
 Using short unlinked shopper IDs directly as keys avoids a lock during event and click lookup. On the same seed-7 data, this cut the median from 6.03 seconds at `5cc01d1` to 5.52 seconds across six runs per build. Median peak container memory rose from 3.28 to 3.32 GiB. Both practice reports still matched.
+
+The default build combines direct shopper lookup with inline click IDs, shopper name reuse, and indexed campaign totals. In the [seed-7 benchmarks](docs/report-benchmarks.md), it cut the median whole job from 6.08 to 5.00 seconds. Against direct lookup plus inline clicks, it won four of eight back-to-back pairs.

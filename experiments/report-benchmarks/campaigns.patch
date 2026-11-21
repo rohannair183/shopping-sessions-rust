@@ -1,0 +1,280 @@
+--- /dev/null
++++ b/src/campaign.rs
+@@ -0,0 +1,115 @@
++use crate::{model::CampaignStats, time::DAY};
++use std::collections::HashMap;
++
++// The group reports and final merge share this budget for dense totals.
++const DENSE_BUDGET: usize = 64 * 1024 * 1024;
++pub type CampaignRow = ((usize, i32), CampaignStats);
++
++pub enum CampaignDays {
++    Dense {
++        first_day: i32,
++        days: usize,
++        slots: Vec<CampaignStats>,
++    },
++    Sparse(HashMap<(usize, i32), CampaignStats>),
++}
++
++impl CampaignDays {
++    pub fn new(campaigns: usize, start: i64, end: i64, groups: usize) -> Self {
++        let first = start.div_euclid(DAY);
++        let last = (end - 1).div_euclid(DAY);
++        let max_slots = DENSE_BUDGET / size_of::<CampaignStats>() / groups.saturating_add(1);
++        if let (Ok(first_day), Ok(_)) = (i32::try_from(first), i32::try_from(last))
++            && let Ok(days) = usize::try_from(last - first + 1)
++            && let Some(count) = days.checked_mul(campaigns)
++            && count <= max_slots
++        {
++            return Self::Dense {
++                first_day,
++                days,
++                slots: vec![CampaignStats::default(); count],
++            };
++        }
++        Self::Sparse(HashMap::new())
++    }
++
++    pub fn get_mut(&mut self, campaign: usize, day: i32) -> &mut CampaignStats {
++        match self {
++            Self::Dense {
++                first_day,
++                days,
++                slots,
++            } => &mut slots[campaign * *days + (day - *first_day) as usize],
++            Self::Sparse(rows) => rows.entry((campaign, day)).or_default(),
++        }
++    }
++
++    pub fn merge(&mut self, part: Self) {
++        match (self, part) {
++            (Self::Dense { slots, .. }, Self::Dense { slots: part, .. }) => {
++                for (total, stats) in slots.iter_mut().zip(part) {
++                    total.add(stats);
++                }
++            }
++            (Self::Sparse(rows), Self::Sparse(part)) => {
++                for (key, stats) in part {
++                    rows.entry(key).or_default().add(stats);
++                }
++            }
++            _ => unreachable!("All groups use the same catalog, window and memory budget"),
++        }
++    }
++
++    pub fn into_rows(self) -> Vec<CampaignRow> {
++        match self {
++            Self::Dense {
++                first_day,
++                days,
++                slots,
++            } => slots
++                .into_iter()
++                .enumerate()
++                .filter(|(_, s)| s.sessions > 0 || s.assists > 0)
++                .map(|(i, s)| ((i / days, first_day + (i % days) as i32), s))
++                .collect(),
++            Self::Sparse(rows) => rows.into_iter().collect(),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn dense_and_sparse_keep_only_credited_or_assisted_days_after_merge() {
++        // The half-open window crosses the epoch and ends at midnight on day 2.
++        for campaigns in [3, usize::MAX] {
++            let new = || CampaignDays::new(campaigns, -1, 2 * DAY, 24);
++            let mut a = new();
++            assert_eq!(matches!(a, CampaignDays::Dense { .. }), campaigns == 3);
++            a.get_mut(0, -1).sessions = 1;
++            a.get_mut(2, 1).assists = 2;
++            let mut b = new();
++            b.get_mut(0, -1).sessions = 2;
++            b.get_mut(1, 0).purchases = 1;
++            b.get_mut(1, 0).revenue = 200;
++            b.get_mut(1, 0).sessions = 1;
++            a.merge(b);
++            let mut result: Vec<_> = a
++                .into_rows()
++                .into_iter()
++                .map(|(key, s)| (key, s.sessions, s.purchases, s.revenue, s.assists))
++                .collect();
++            result.sort_unstable();
++            assert_eq!(
++                result,
++                [
++                    ((0, -1), 3, 0, 0, 0),
++                    ((1, 0), 1, 1, 200, 0),
++                    ((2, 1), 0, 0, 0, 2)
++                ]
++            );
++        }
++    }
++}
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -1,5 +1,6 @@
+ use crate::{
+     Result,
++    campaign::CampaignDays,
+     csv::{Chunk, chunks, fields},
+     identity::People,
+     model::{Click, Event, Person},
+@@ -73,6 +74,10 @@
+             start,
+             end,
+         })
++    }
++
++    pub fn campaign_totals(&self, groups: usize) -> CampaignDays {
++        CampaignDays::new(self.campaigns.len(), self.start, self.end, groups)
+     }
+ 
+     fn event(&self, row: &[&str; 7], ingest: i64) -> Option<Event> {
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
++mod campaign;
+ mod csv;
+ mod identity;
+ mod input;
+@@ -6,9 +7,10 @@
+ mod report;
+ mod time;
+ 
++use campaign::CampaignDays;
+ use identity::Names;
+ use input::Lookups;
+-use model::{CampaignDays, Click, Event, Person, Timeline};
++use model::{Click, Event, Person, Timeline};
+ use rayon::prelude::*;
+ use std::{
+     collections::HashMap,
+@@ -45,6 +47,7 @@
+     refs: &Lookups,
+     names: &Names,
+     folder: &Path,
++    groups: usize,
+ ) -> Result<(usize, CampaignDays)> {
+     let mut people: HashMap<Person, Timeline> = HashMap::new();
+     for (user, e) in events.into_iter().flatten() {
+@@ -56,7 +59,7 @@
+         }
+     }
+     let mut rows = Vec::new();
+-    let mut totals = CampaignDays::new();
++    let mut totals = refs.campaign_totals(groups);
+     for (person, timeline) in people {
+         report::shopper(person, timeline, &mut rows, &mut totals);
+     }
+@@ -104,21 +107,20 @@
+         .into_par_iter()
+         .zip(clicks)
+         .enumerate()
+-        .map(|(group, (e, c))| summarize(group, e, c, &refs, &names, &user_folder))
++        .map(|(group, (e, c))| summarize(group, e, c, &refs, &names, &user_folder, groups))
+         .collect::<Result<_>>()?;
+     let mut count = 0;
+-    let mut totals = CampaignDays::new();
++    let mut totals = refs.campaign_totals(groups);
+     for (rows, part) in parts {
+         count += rows;
+-        for (key, stats) in part {
+-            totals.entry(key).or_default().add(stats);
+-        }
++        totals.merge(part);
+     }
+     if count == 0 {
+         output::users(&user_folder.join("part-000.parquet"), &[], &refs, &names)?;
+     }
++    let totals = totals.into_rows();
+     let campaigns = totals.len();
+-    output::campaigns(&campaign_folder.join("part-000.parquet"), totals, &refs)?;
++    output::campaigns(&campaign_folder.join("part-000.parquet"), &totals, &refs)?;
+     eprintln!(
+         "{} shopper rows, {} campaign rows; lookups {:.3}s, input and dedup {:.3}s, reports and write {:.3}s",
+         count,
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -1,5 +1,3 @@
+-use std::collections::HashMap;
+-
+ pub type Person = usize;
+ 
+ pub struct Event {
+@@ -25,7 +23,7 @@
+     pub revenue: i64,
+     pub top: Option<usize>,
+ }
+-#[derive(Default)]
++#[derive(Clone, Default)]
+ pub struct CampaignStats {
+     pub sessions: i64,
+     pub purchases: i64,
+@@ -40,5 +38,4 @@
+         self.assists += other.assists;
+     }
+ }
+-pub type CampaignDays = HashMap<(usize, i32), CampaignStats>;
+ pub const ORGANIC: usize = 0;
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -1,9 +1,4 @@
+-use crate::{
+-    Result,
+-    identity::Names,
+-    input::Lookups,
+-    model::{CampaignDays, UserRow},
+-};
++use crate::{Result, campaign::CampaignRow, identity::Names, input::Lookups, model::UserRow};
+ use parquet::{
+     data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type},
+     file::writer::SerializedFileWriter,
+@@ -86,9 +81,8 @@
+     })
+ }
+ 
+-pub fn campaigns(path: &Path, rows: CampaignDays, refs: &Lookups) -> Result<()> {
+-    let rows: Vec<_> = rows.into_iter().collect();
+-    table(path, CAMPAIGN, &rows, |b| {
++pub fn campaigns(path: &Path, rows: &[CampaignRow], refs: &Lookups) -> Result<()> {
++    table(path, CAMPAIGN, rows, |b| {
+         vec![
+             Column::Text(
+                 b.iter()
+--- a/src/report.rs
++++ b/src/report.rs
+@@ -1,5 +1,6 @@
+ use crate::{
+-    model::{CampaignDays, Click, Event, ORGANIC, Person, Timeline, UserRow},
++    campaign::CampaignDays,
++    model::{Click, Event, ORGANIC, Person, Timeline, UserRow},
+     time::{DAY, VISIT_GAP, WEEK},
+ };
+ use std::collections::HashMap;
+@@ -89,7 +90,7 @@
+             .map(|i| &clicks[i])
+             .filter(|c| visit.start - c.ts <= WEEK)
+             .map_or(ORGANIC, |c| c.campaign);
+-        let stats = totals.entry((campaign, visit.day)).or_default();
++        let stats = totals.get_mut(campaign, visit.day);
+         stats.sessions += 1;
+         stats.purchases += i64::from(visit.revenue > 0);
+         stats.revenue += visit.revenue;
+@@ -120,10 +121,7 @@
+         let mut add = left.max(counted.insert(c.campaign, right).unwrap_or(0));
+         while add < right {
+             let end = right.min(day_end[add]);
+-            totals
+-                .entry((c.campaign, visits[add].day))
+-                .or_default()
+-                .assists += (end - add) as i64;
++            totals.get_mut(c.campaign, visits[add].day).assists += (end - add) as i64;
+             add = end;
+         }
+     }

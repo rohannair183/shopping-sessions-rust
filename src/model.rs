@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 pub type Person = usize;
 
 pub struct Event {
@@ -7,8 +5,43 @@ pub struct Event {
     pub cents: i64,
     pub category: usize,
 }
+
+// Generated click IDs use at most nine bytes: a prefix and eight base-36 digits.
+const INLINE_CLICK_BYTES: usize = 9;
+
+pub enum ClickId {
+    Inline {
+        bytes: [u8; INLINE_CLICK_BYTES],
+        len: u8,
+    },
+    Text(Box<str>),
+}
+
+impl From<&str> for ClickId {
+    fn from(id: &str) -> Self {
+        if id.len() > INLINE_CLICK_BYTES {
+            return Self::Text(id.into());
+        }
+        let mut bytes = [0; INLINE_CLICK_BYTES];
+        bytes[..id.len()].copy_from_slice(id.as_bytes());
+        Self::Inline {
+            bytes,
+            len: id.len() as u8,
+        }
+    }
+}
+
+impl ClickId {
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Inline { bytes, len } => &bytes[..usize::from(*len)],
+            Self::Text(id) => id.as_bytes(),
+        }
+    }
+}
+
 pub struct Click {
-    pub id: Box<str>,
+    pub id: ClickId,
     pub ts: i64,
     pub campaign: usize,
 }
@@ -25,7 +58,7 @@ pub struct UserRow {
     pub revenue: i64,
     pub top: Option<usize>,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CampaignStats {
     pub sessions: i64,
     pub purchases: i64,
@@ -40,5 +73,4 @@ impl CampaignStats {
         self.assists += other.assists;
     }
 }
-pub type CampaignDays = HashMap<(usize, i32), CampaignStats>;
 pub const ORGANIC: usize = 0;

@@ -1,5 +1,6 @@
 use crate::{
-    model::{CampaignDays, Click, Event, ORGANIC, Person, Timeline, UserRow},
+    campaign::CampaignDays,
+    model::{Click, Event, ORGANIC, Person, Timeline, UserRow},
     time::{DAY, VISIT_GAP, WEEK},
 };
 use std::collections::HashMap;
@@ -44,8 +45,10 @@ pub fn shopper(
     // Put the smallest click ID last at each timestamp so a forward scan retains it.
     timeline
         .clicks
-        .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(&a.id)));
-    timeline.clicks.dedup_by(|a, b| a.id == b.id);
+        .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.bytes().cmp(a.id.bytes())));
+    timeline
+        .clicks
+        .dedup_by(|a, b| a.id.bytes() == b.id.bytes());
     credit(&visits, &timeline.clicks, campaigns);
     assists(&visits, &timeline.clicks, campaigns);
 }
@@ -89,7 +92,7 @@ fn credit(visits: &[Visit], clicks: &[Click], totals: &mut CampaignDays) {
             .map(|i| &clicks[i])
             .filter(|c| visit.start - c.ts <= WEEK)
             .map_or(ORGANIC, |c| c.campaign);
-        let stats = totals.entry((campaign, visit.day)).or_default();
+        let stats = totals.get_mut(campaign, visit.day);
         stats.sessions += 1;
         stats.purchases += i64::from(visit.revenue > 0);
         stats.revenue += visit.revenue;
@@ -120,11 +123,46 @@ fn assists(visits: &[Visit], clicks: &[Click], totals: &mut CampaignDays) {
         let mut add = left.max(counted.insert(c.campaign, right).unwrap_or(0));
         while add < right {
             let end = right.min(day_end[add]);
-            totals
-                .entry((c.campaign, visits[add].day))
-                .or_default()
-                .assists += (end - add) as i64;
+            totals.get_mut(c.campaign, visits[add].day).assists += (end - add) as i64;
             add = end;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_time_clicks_credit_the_smallest_original_id() {
+        for (winner, runner_up) in [
+            ("ka", "ka\0"),
+            ("ka1234567", "ka12345670"),
+            ("a123456789", "b"),
+            ("K12345678", "k12345678"),
+            ("éééééa", "éééééb"),
+        ] {
+            let timeline = Timeline {
+                events: vec![Event {
+                    ts: 0,
+                    cents: 25,
+                    category: 0,
+                }],
+                clicks: [(runner_up, 2), (winner, 1), (winner, 1)]
+                    .map(|(id, campaign)| Click {
+                        id: id.into(),
+                        ts: 0,
+                        campaign,
+                    })
+                    .into(),
+            };
+            let mut totals = CampaignDays::new(3, 0, DAY, 1);
+            shopper(0, timeline, &mut Vec::new(), &mut totals);
+            let totals: HashMap<_, _> = totals.into_rows().into_iter().collect();
+            assert_eq!(totals[&(1, 0)].revenue, 25, "{winner:?} vs {runner_up:?}");
+            assert_eq!(totals[&(2, 0)].sessions, 0);
+            assert_eq!(totals[&(1, 0)].assists, 1);
+            assert_eq!(totals[&(2, 0)].assists, 1);
         }
     }
 }

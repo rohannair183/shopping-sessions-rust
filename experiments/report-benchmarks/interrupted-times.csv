@@ -1,0 +1,7 @@
+phase,round,position,variant,elapsed_ns,lookups_s,input_dedup_s,reports_write_s,peak_bytes
+final,4,1,baseline,8814994826,0.895,4.354,3.346,3542532096
+final,4,2,lookup,7594063891,0.974,4.406,2.044,3574026240
+final,4,3,lookup-clicks,5158092131,0.816,2.712,1.465,3422556160
+final,4,4,combined,4644241655,0.857,2.467,1.169,3447013376
+final,5,1,lookup,6029931080,0.840,3.266,1.761,3578855424
+final,5,2,combined,5241307138,0.921,2.786,1.374,3414351872

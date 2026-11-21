@@ -1,3 +1,4 @@
+mod campaign;
 mod csv;
 mod identity;
 mod input;
@@ -6,9 +7,10 @@ mod output;
 mod report;
 mod time;
 
+use campaign::CampaignDays;
 use identity::Names;
 use input::Lookups;
-use model::{CampaignDays, Click, Event, Person, Timeline};
+use model::{Click, Event, Person, Timeline};
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
@@ -45,6 +47,7 @@ fn summarize(
     refs: &Lookups,
     names: &Names,
     folder: &Path,
+    groups: usize,
 ) -> Result<(usize, CampaignDays)> {
     let mut people: HashMap<Person, Timeline> = HashMap::new();
     for (user, e) in events.into_iter().flatten() {
@@ -56,7 +59,7 @@ fn summarize(
         }
     }
     let mut rows = Vec::new();
-    let mut totals = CampaignDays::new();
+    let mut totals = refs.campaign_totals(groups);
     for (person, timeline) in people {
         report::shopper(person, timeline, &mut rows, &mut totals);
     }
@@ -104,21 +107,20 @@ fn run() -> Result<()> {
         .into_par_iter()
         .zip(clicks)
         .enumerate()
-        .map(|(group, (e, c))| summarize(group, e, c, &refs, &names, &user_folder))
+        .map(|(group, (e, c))| summarize(group, e, c, &refs, &names, &user_folder, groups))
         .collect::<Result<_>>()?;
     let mut count = 0;
-    let mut totals = CampaignDays::new();
+    let mut totals = refs.campaign_totals(groups);
     for (rows, part) in parts {
         count += rows;
-        for (key, stats) in part {
-            totals.entry(key).or_default().add(stats);
-        }
+        totals.merge(part);
     }
     if count == 0 {
         output::users(&user_folder.join("part-000.parquet"), &[], &refs, &names)?;
     }
+    let totals = totals.into_rows();
     let campaigns = totals.len();
-    output::campaigns(&campaign_folder.join("part-000.parquet"), totals, &refs)?;
+    output::campaigns(&campaign_folder.join("part-000.parquet"), &totals, &refs)?;
     eprintln!(
         "{} shopper rows, {} campaign rows; lookups {:.3}s, input and dedup {:.3}s, reports and write {:.3}s",
         count,

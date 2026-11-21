@@ -1,0 +1,103 @@
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -7,8 +7,43 @@
+     pub cents: i64,
+     pub category: usize,
+ }
++
++// Generated click IDs use at most nine bytes: a prefix and eight base-36 digits.
++const INLINE_CLICK_BYTES: usize = 9;
++
++pub enum ClickId {
++    Inline {
++        bytes: [u8; INLINE_CLICK_BYTES],
++        len: u8,
++    },
++    Text(Box<str>),
++}
++
++impl From<&str> for ClickId {
++    fn from(id: &str) -> Self {
++        if id.len() > INLINE_CLICK_BYTES {
++            return Self::Text(id.into());
++        }
++        let mut bytes = [0; INLINE_CLICK_BYTES];
++        bytes[..id.len()].copy_from_slice(id.as_bytes());
++        Self::Inline {
++            bytes,
++            len: id.len() as u8,
++        }
++    }
++}
++
++impl ClickId {
++    pub fn bytes(&self) -> &[u8] {
++        match self {
++            Self::Inline { bytes, len } => &bytes[..usize::from(*len)],
++            Self::Text(id) => id.as_bytes(),
++        }
++    }
++}
++
+ pub struct Click {
+-    pub id: Box<str>,
++    pub id: ClickId,
+     pub ts: i64,
+     pub campaign: usize,
+ }
+--- a/src/report.rs
++++ b/src/report.rs
+@@ -44,8 +44,10 @@
+     // Put the smallest click ID last at each timestamp so a forward scan retains it.
+     timeline
+         .clicks
+-        .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(&a.id)));
+-    timeline.clicks.dedup_by(|a, b| a.id == b.id);
++        .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.bytes().cmp(a.id.bytes())));
++    timeline
++        .clicks
++        .dedup_by(|a, b| a.id.bytes() == b.id.bytes());
+     credit(&visits, &timeline.clicks, campaigns);
+     assists(&visits, &timeline.clicks, campaigns);
+ }
+@@ -128,3 +130,40 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn equal_time_clicks_credit_the_smallest_original_id() {
++        for (winner, runner_up) in [
++            ("ka", "ka\0"),
++            ("ka1234567", "ka12345670"),
++            ("a123456789", "b"),
++            ("K12345678", "k12345678"),
++            ("éééééa", "éééééb"),
++        ] {
++            let timeline = Timeline {
++                events: vec![Event {
++                    ts: 0,
++                    cents: 25,
++                    category: 0,
++                }],
++                clicks: [(runner_up, 2), (winner, 1), (winner, 1)]
++                    .map(|(id, campaign)| Click {
++                        id: id.into(),
++                        ts: 0,
++                        campaign,
++                    })
++                    .into(),
++            };
++            let mut totals = CampaignDays::new();
++            shopper(0, timeline, &mut Vec::new(), &mut totals);
++            assert_eq!(totals[&(1, 0)].revenue, 25, "{winner:?} vs {runner_up:?}");
++            assert_eq!(totals[&(2, 0)].sessions, 0);
++            assert_eq!(totals[&(1, 0)].assists, 1);
++            assert_eq!(totals[&(2, 0)].assists, 1);
++        }
++    }
++}

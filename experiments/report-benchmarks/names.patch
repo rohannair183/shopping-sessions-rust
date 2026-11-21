@@ -1,0 +1,44 @@
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -2,7 +2,7 @@
+     Result,
+     identity::Names,
+     input::Lookups,
+-    model::{CampaignDays, UserRow},
++    model::{CampaignDays, Person, UserRow},
+ };
+ use parquet::{
+     data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type},
+@@ -29,7 +29,7 @@
+     path: &Path,
+     schema: &str,
+     rows: &[T],
+-    columns: impl Fn(&[T]) -> Vec<Column>,
++    mut columns: impl FnMut(&[T]) -> Vec<Column>,
+ ) -> Result<()> {
+     let file = File::create_new(path)?;
+     let mut writer = SerializedFileWriter::new(
+@@ -64,11 +64,22 @@
+ }
+ 
+ pub fn users(path: &Path, rows: &[UserRow], refs: &Lookups, names: &Names) -> Result<()> {
++    // A shopper's daily rows are consecutive and can span Parquet row groups.
++    let mut previous: Option<(Person, ByteArray)> = None;
+     table(path, USER, rows, |b| {
+         vec![
+             Column::Text(
+                 b.iter()
+-                    .map(|r| ByteArray::from(names.get(r.person)))
++                    .map(|r| {
++                        if let Some((person, name)) = &previous
++                            && *person == r.person
++                        {
++                            return name.clone();
++                        }
++                        let name = ByteArray::from(names.get(r.person));
++                        previous = Some((r.person, name.clone()));
++                        name
++                    })
+                     .collect(),
+                 None,
+             ),

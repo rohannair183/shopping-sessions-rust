@@ -1,0 +1,410 @@
+--- /dev/null
++++ b/src/campaign.rs
+@@ -0,0 +1,115 @@
++use crate::{model::CampaignStats, time::DAY};
++use std::collections::HashMap;
++
++// The group reports and final merge share this budget for dense totals.
++const DENSE_BUDGET: usize = 64 * 1024 * 1024;
++pub type CampaignRow = ((usize, i32), CampaignStats);
++
++pub enum CampaignDays {
++    Dense {
++        first_day: i32,
++        days: usize,
++        slots: Vec<CampaignStats>,
++    },
++    Sparse(HashMap<(usize, i32), CampaignStats>),
++}
++
++impl CampaignDays {
++    pub fn new(campaigns: usize, start: i64, end: i64, groups: usize) -> Self {
++        let first = start.div_euclid(DAY);
++        let last = (end - 1).div_euclid(DAY);
++        let max_slots = DENSE_BUDGET / size_of::<CampaignStats>() / groups.saturating_add(1);
++        if let (Ok(first_day), Ok(_)) = (i32::try_from(first), i32::try_from(last))
++            && let Ok(days) = usize::try_from(last - first + 1)
++            && let Some(count) = days.checked_mul(campaigns)
++            && count <= max_slots
++        {
++            return Self::Dense {
++                first_day,
++                days,
++                slots: vec![CampaignStats::default(); count],
++            };
++        }
++        Self::Sparse(HashMap::new())
++    }
++
++    pub fn get_mut(&mut self, campaign: usize, day: i32) -> &mut CampaignStats {
++        match self {
++            Self::Dense {
++                first_day,
++                days,
++                slots,
++            } => &mut slots[campaign * *days + (day - *first_day) as usize],
++            Self::Sparse(rows) => rows.entry((campaign, day)).or_default(),
++        }
++    }
++
++    pub fn merge(&mut self, part: Self) {
++        match (self, part) {
++            (Self::Dense { slots, .. }, Self::Dense { slots: part, .. }) => {
++                for (total, stats) in slots.iter_mut().zip(part) {
++                    total.add(stats);
++                }
++            }
++            (Self::Sparse(rows), Self::Sparse(part)) => {
++                for (key, stats) in part {
++                    rows.entry(key).or_default().add(stats);
++                }
++            }
++            _ => unreachable!("All groups use the same catalog, window and memory budget"),
++        }
++    }
++
++    pub fn into_rows(self) -> Vec<CampaignRow> {
++        match self {
++            Self::Dense {
++                first_day,
++                days,
++                slots,
++            } => slots
++                .into_iter()
++                .enumerate()
++                .filter(|(_, s)| s.sessions > 0 || s.assists > 0)
++                .map(|(i, s)| ((i / days, first_day + (i % days) as i32), s))
++                .collect(),
++            Self::Sparse(rows) => rows.into_iter().collect(),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn dense_and_sparse_keep_only_credited_or_assisted_days_after_merge() {
++        // The half-open window crosses the epoch and ends at midnight on day 2.
++        for campaigns in [3, usize::MAX] {
++            let new = || CampaignDays::new(campaigns, -1, 2 * DAY, 24);
++            let mut a = new();
++            assert_eq!(matches!(a, CampaignDays::Dense { .. }), campaigns == 3);
++            a.get_mut(0, -1).sessions = 1;
++            a.get_mut(2, 1).assists = 2;
++            let mut b = new();
++            b.get_mut(0, -1).sessions = 2;
++            b.get_mut(1, 0).purchases = 1;
++            b.get_mut(1, 0).revenue = 200;
++            b.get_mut(1, 0).sessions = 1;
++            a.merge(b);
++            let mut result: Vec<_> = a
++                .into_rows()
++                .into_iter()
++                .map(|(key, s)| (key, s.sessions, s.purchases, s.revenue, s.assists))
++                .collect();
++            result.sort_unstable();
++            assert_eq!(
++                result,
++                [
++                    ((0, -1), 3, 0, 0, 0),
++                    ((1, 0), 1, 1, 200, 0),
++                    ((2, 1), 0, 0, 0, 2)
++                ]
++            );
++        }
++    }
++}
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -1,5 +1,6 @@
+ use crate::{
+     Result,
++    campaign::CampaignDays,
+     csv::{Chunk, chunks, fields},
+     identity::People,
+     model::{Click, Event, Person},
+@@ -73,6 +74,10 @@
+             start,
+             end,
+         })
++    }
++
++    pub fn campaign_totals(&self, groups: usize) -> CampaignDays {
++        CampaignDays::new(self.campaigns.len(), self.start, self.end, groups)
+     }
+ 
+     fn event(&self, row: &[&str; 7], ingest: i64) -> Option<Event> {
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
++mod campaign;
+ mod csv;
+ mod identity;
+ mod input;
+@@ -6,9 +7,10 @@
+ mod report;
+ mod time;
+ 
++use campaign::CampaignDays;
+ use identity::Names;
+ use input::Lookups;
+-use model::{CampaignDays, Click, Event, Person, Timeline};
++use model::{Click, Event, Person, Timeline};
+ use rayon::prelude::*;
+ use std::{
+     collections::HashMap,
+@@ -45,6 +47,7 @@
+     refs: &Lookups,
+     names: &Names,
+     folder: &Path,
++    groups: usize,
+ ) -> Result<(usize, CampaignDays)> {
+     let mut people: HashMap<Person, Timeline> = HashMap::new();
+     for (user, e) in events.into_iter().flatten() {
+@@ -56,7 +59,7 @@
+         }
+     }
+     let mut rows = Vec::new();
+-    let mut totals = CampaignDays::new();
++    let mut totals = refs.campaign_totals(groups);
+     for (person, timeline) in people {
+         report::shopper(person, timeline, &mut rows, &mut totals);
+     }
+@@ -104,21 +107,20 @@
+         .into_par_iter()
+         .zip(clicks)
+         .enumerate()
+-        .map(|(group, (e, c))| summarize(group, e, c, &refs, &names, &user_folder))
++        .map(|(group, (e, c))| summarize(group, e, c, &refs, &names, &user_folder, groups))
+         .collect::<Result<_>>()?;
+     let mut count = 0;
+-    let mut totals = CampaignDays::new();
++    let mut totals = refs.campaign_totals(groups);
+     for (rows, part) in parts {
+         count += rows;
+-        for (key, stats) in part {
+-            totals.entry(key).or_default().add(stats);
+-        }
++        totals.merge(part);
+     }
+     if count == 0 {
+         output::users(&user_folder.join("part-000.parquet"), &[], &refs, &names)?;
+     }
++    let totals = totals.into_rows();
+     let campaigns = totals.len();
+-    output::campaigns(&campaign_folder.join("part-000.parquet"), totals, &refs)?;
++    output::campaigns(&campaign_folder.join("part-000.parquet"), &totals, &refs)?;
+     eprintln!(
+         "{} shopper rows, {} campaign rows; lookups {:.3}s, input and dedup {:.3}s, reports and write {:.3}s",
+         count,
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -1,5 +1,3 @@
+-use std::collections::HashMap;
+-
+ pub type Person = usize;
+ 
+ pub struct Event {
+@@ -7,8 +5,43 @@
+     pub cents: i64,
+     pub category: usize,
+ }
++
++// Generated click IDs use at most nine bytes: a prefix and eight base-36 digits.
++const INLINE_CLICK_BYTES: usize = 9;
++
++pub enum ClickId {
++    Inline {
++        bytes: [u8; INLINE_CLICK_BYTES],
++        len: u8,
++    },
++    Text(Box<str>),
++}
++
++impl From<&str> for ClickId {
++    fn from(id: &str) -> Self {
++        if id.len() > INLINE_CLICK_BYTES {
++            return Self::Text(id.into());
++        }
++        let mut bytes = [0; INLINE_CLICK_BYTES];
++        bytes[..id.len()].copy_from_slice(id.as_bytes());
++        Self::Inline {
++            bytes,
++            len: id.len() as u8,
++        }
++    }
++}
++
++impl ClickId {
++    pub fn bytes(&self) -> &[u8] {
++        match self {
++            Self::Inline { bytes, len } => &bytes[..usize::from(*len)],
++            Self::Text(id) => id.as_bytes(),
++        }
++    }
++}
++
+ pub struct Click {
+-    pub id: Box<str>,
++    pub id: ClickId,
+     pub ts: i64,
+     pub campaign: usize,
+ }
+@@ -25,7 +58,7 @@
+     pub revenue: i64,
+     pub top: Option<usize>,
+ }
+-#[derive(Default)]
++#[derive(Clone, Default)]
+ pub struct CampaignStats {
+     pub sessions: i64,
+     pub purchases: i64,
+@@ -40,5 +73,4 @@
+         self.assists += other.assists;
+     }
+ }
+-pub type CampaignDays = HashMap<(usize, i32), CampaignStats>;
+ pub const ORGANIC: usize = 0;
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -1,8 +1,9 @@
+ use crate::{
+     Result,
++    campaign::CampaignRow,
+     identity::Names,
+     input::Lookups,
+-    model::{CampaignDays, UserRow},
++    model::{Person, UserRow},
+ };
+ use parquet::{
+     data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type},
+@@ -29,7 +30,7 @@
+     path: &Path,
+     schema: &str,
+     rows: &[T],
+-    columns: impl Fn(&[T]) -> Vec<Column>,
++    mut columns: impl FnMut(&[T]) -> Vec<Column>,
+ ) -> Result<()> {
+     let file = File::create_new(path)?;
+     let mut writer = SerializedFileWriter::new(
+@@ -64,11 +65,22 @@
+ }
+ 
+ pub fn users(path: &Path, rows: &[UserRow], refs: &Lookups, names: &Names) -> Result<()> {
++    // A shopper's daily rows are consecutive and can span Parquet row groups.
++    let mut previous: Option<(Person, ByteArray)> = None;
+     table(path, USER, rows, |b| {
+         vec![
+             Column::Text(
+                 b.iter()
+-                    .map(|r| names.with_name(r.person, |name| ByteArray::from(name)))
++                    .map(|r| {
++                        if let Some((person, name)) = &previous
++                            && *person == r.person
++                        {
++                            return name.clone();
++                        }
++                        let name = names.with_name(r.person, |name| ByteArray::from(name));
++                        previous = Some((r.person, name.clone()));
++                        name
++                    })
+                     .collect(),
+                 None,
+             ),
+@@ -86,9 +98,8 @@
+     })
+ }
+ 
+-pub fn campaigns(path: &Path, rows: CampaignDays, refs: &Lookups) -> Result<()> {
+-    let rows: Vec<_> = rows.into_iter().collect();
+-    table(path, CAMPAIGN, &rows, |b| {
++pub fn campaigns(path: &Path, rows: &[CampaignRow], refs: &Lookups) -> Result<()> {
++    table(path, CAMPAIGN, rows, |b| {
+         vec![
+             Column::Text(
+                 b.iter()
+--- a/src/report.rs
++++ b/src/report.rs
+@@ -1,5 +1,6 @@
+ use crate::{
+-    model::{CampaignDays, Click, Event, ORGANIC, Person, Timeline, UserRow},
++    campaign::CampaignDays,
++    model::{Click, Event, ORGANIC, Person, Timeline, UserRow},
+     time::{DAY, VISIT_GAP, WEEK},
+ };
+ use std::collections::HashMap;
+@@ -44,8 +45,10 @@
+     // Put the smallest click ID last at each timestamp so a forward scan retains it.
+     timeline
+         .clicks
+-        .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.cmp(&a.id)));
+-    timeline.clicks.dedup_by(|a, b| a.id == b.id);
++        .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| b.id.bytes().cmp(a.id.bytes())));
++    timeline
++        .clicks
++        .dedup_by(|a, b| a.id.bytes() == b.id.bytes());
+     credit(&visits, &timeline.clicks, campaigns);
+     assists(&visits, &timeline.clicks, campaigns);
+ }
+@@ -89,7 +92,7 @@
+             .map(|i| &clicks[i])
+             .filter(|c| visit.start - c.ts <= WEEK)
+             .map_or(ORGANIC, |c| c.campaign);
+-        let stats = totals.entry((campaign, visit.day)).or_default();
++        let stats = totals.get_mut(campaign, visit.day);
+         stats.sessions += 1;
+         stats.purchases += i64::from(visit.revenue > 0);
+         stats.revenue += visit.revenue;
+@@ -120,11 +123,46 @@
+         let mut add = left.max(counted.insert(c.campaign, right).unwrap_or(0));
+         while add < right {
+             let end = right.min(day_end[add]);
+-            totals
+-                .entry((c.campaign, visits[add].day))
+-                .or_default()
+-                .assists += (end - add) as i64;
++            totals.get_mut(c.campaign, visits[add].day).assists += (end - add) as i64;
+             add = end;
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn equal_time_clicks_credit_the_smallest_original_id() {
++        for (winner, runner_up) in [
++            ("ka", "ka\0"),
++            ("ka1234567", "ka12345670"),
++            ("a123456789", "b"),
++            ("K12345678", "k12345678"),
++            ("éééééa", "éééééb"),
++        ] {
++            let timeline = Timeline {
++                events: vec![Event {
++                    ts: 0,
++                    cents: 25,
++                    category: 0,
++                }],
++                clicks: [(runner_up, 2), (winner, 1), (winner, 1)]
++                    .map(|(id, campaign)| Click {
++                        id: id.into(),
++                        ts: 0,
++                        campaign,
++                    })
++                    .into(),
++            };
++            let mut totals = CampaignDays::new(3, 0, DAY, 1);
++            shopper(0, timeline, &mut Vec::new(), &mut totals);
++            let totals: HashMap<_, _> = totals.into_rows().into_iter().collect();
++            assert_eq!(totals[&(1, 0)].revenue, 25, "{winner:?} vs {runner_up:?}");
++            assert_eq!(totals[&(2, 0)].sessions, 0);
++            assert_eq!(totals[&(1, 0)].assists, 1);
++            assert_eq!(totals[&(2, 0)].assists, 1);
++        }
++    }
++}

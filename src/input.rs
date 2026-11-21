@@ -1,5 +1,6 @@
 use crate::{
     Result,
+    campaign::CampaignDays,
     csv::{Chunk, chunks, fields},
     identity::People,
     model::{Click, Event, Person},
@@ -73,6 +74,10 @@ impl Lookups {
             start,
             end,
         })
+    }
+
+    pub fn campaign_totals(&self, groups: usize) -> CampaignDays {
+        CampaignDays::new(self.campaigns.len(), self.start, self.end, groups)
     }
 
     fn event(&self, row: &[&str; 7], ingest: i64) -> Option<Event> {
