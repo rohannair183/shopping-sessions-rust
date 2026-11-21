@@ -1,0 +1,7 @@
+/data/
+/runs/
+/target/
+/checks/
+/fixtures/*/
+/tools/generator/target/
+__pycache__/

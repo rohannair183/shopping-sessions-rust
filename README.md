@@ -1,0 +1,51 @@
+# Shopping Sessions in Rust
+
+This project reads the challenge CSVs and writes the two daily Parquet reports. The pipeline, generator, and answer checker run in Docker. You do not need Rust or Python installed on the host.
+
+## Run it locally
+
+Run these commands from this folder with Docker running. The local copy includes all 36 public fixtures. On a fresh clone, download the [official starter](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/starter-duckdb.zip) and copy the contents of its `fixtures/` folder into this project's `fixtures/` before running `make fixtures`.
+
+```sh
+make fixtures
+make sample
+make run DATA=data/sample RUN=runs/my-sample
+```
+
+The last command writes `user_daily/` and `campaign_daily/` under `runs/my-sample/output/`. Choose a new run directory each time so files from an older run cannot change the result.
+
+To compare against the official million-event answer:
+
+```sh
+make dev
+make run check-dev RUN=runs/my-dev-check
+```
+
+The public answer is already in `checks/dev-answer/` on this machine. On a fresh clone, download [dev-answer.zip](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/dev-answer.zip) and unpack it under `checks/` before running `check-dev`.
+
+## What's in the folder
+
+| Path | Contents |
+| --- | --- |
+| `src/` | The Rust pipeline. `main.rs` connects the input, shopper reports, campaign reports, and Parquet writers. |
+| `tools/generator/` | The Rust generator supplied in your ZIP, plus a Dockerfile to build it locally. |
+| `data/sample/` | Generated with seed 42: 10,000 requested events and 2,500 clicks. |
+| `data/dev/` | Generated with seed 1: 1,000,000 requested events and 250,000 clicks. Raw CSV row counts can differ because the generator adds duplicates and malformed rows. |
+| `runs/verified-dev/output/` | Verified Parquet results for the public seed-1 dataset. |
+| `fixtures/` | All 36 official edge cases and their expected rows. |
+| `docs/rules.md` | Exact input, cleaning, counting, and output rules. |
+| `scripts/` | Local Docker runners, the official row readers and comparator, and a batch fixture check. |
+
+Input data, fixture datasets, expected answers, and run outputs are excluded from Git. The submission builds from the root Dockerfile, Rust source, and Cargo files.
+
+## Where to make changes
+
+- **Input:** `csv.rs` divides files into chunks and enforces the challenge CSV rules. `time.rs` parses timestamps. `identity.rs` links IDs across files. `input.rs` keeps the earliest copy of each event across all chunks, including invalid copies, before selecting survivors.
+- **Reports:** `report.rs` builds visits once per shopper. A forward scan gives credit to the latest eligible click. For assists, it counts only the visit starts a campaign has not already covered.
+- **Output:** `output.rs` writes typed Parquet columns. The pipeline writes shopper rows by partition and merges campaign counts across partitions.
+
+The local runner defaults to six pinned vCPUs and 8 GiB without swap. It runs the Linux amd64 image with networking off, read-only input, a read-only root filesystem, and uid 1000. A native amd64 machine with sufficient resources can run `make run NCPU=8 MEM_GB=24 RUN=runs/native-dev`. The binary keeps intermediate records in memory and prints phase timings to stderr. Peak memory and runtime at practice and final size have not been measured.
+
+## Verified in this workspace
+
+Both tables matched all 36 official fixtures. The public million-event run matched all 117,038 shopper rows and 27,400 campaign rows, including schema and values. The comparator found no missing rows, extra rows, or duplicate keys.
