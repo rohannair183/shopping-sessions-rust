@@ -1,0 +1,903 @@
+--- /dev/null
++++ b/src/csv/event_scan.rs
+@@ -0,0 +1,159 @@
++use super::fields;
++
++const WIDTH: usize = u64::BITS as usize;
++const MAX_INLINE_ROW: usize = u128::BITS as usize - 1;
++
++#[derive(Default)]
++struct Masks {
++    commas: u64,
++    quotes: u64,
++    newlines: u64,
++}
++
++#[cfg(not(target_arch = "x86_64"))]
++fn classify(block: &[u8; WIDTH]) -> Masks {
++    let mut masks = Masks::default();
++    for (i, &byte) in block.iter().enumerate() {
++        match byte {
++            b',' => masks.commas |= 1 << i,
++            b'"' => masks.quotes |= 1 << i,
++            b'\n' => masks.newlines |= 1 << i,
++            _ => {}
++        }
++    }
++    masks
++}
++
++#[cfg(target_arch = "x86_64")]
++mod x86 {
++    use super::{Masks, WIDTH};
++    use std::arch::x86_64::*;
++
++    pub(super) fn sse2(block: &[u8; WIDTH]) -> Masks {
++        let mut m = Masks::default();
++        for offset in (0..WIDTH).step_by(16) {
++            // SSE2 is part of x86-64. Each load stays within the 64-byte block.
++            unsafe {
++                let bytes = _mm_loadu_si128(block.as_ptr().add(offset).cast());
++                let mask =
++                    |byte| _mm_movemask_epi8(_mm_cmpeq_epi8(bytes, _mm_set1_epi8(byte))) as u64;
++                m.commas |= mask(b',' as i8) << offset;
++                m.quotes |= mask(b'"' as i8) << offset;
++                m.newlines |= mask(b'\n' as i8) << offset;
++            }
++        }
++        m
++    }
++
++    #[target_feature(enable = "avx2")]
++    pub(super) unsafe fn avx2(block: &[u8; WIDTH]) -> Masks {
++        let mut m = Masks::default();
++        for offset in [0, 32] {
++            // The caller checks AVX2 support. Each load stays within the block.
++            let bytes = unsafe { _mm256_loadu_si256(block.as_ptr().add(offset).cast()) };
++            let mask = |byte| {
++                _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(byte))) as u32 as u64
++            };
++            m.commas |= mask(b',' as i8) << offset;
++            m.quotes |= mask(b'"' as i8) << offset;
++            m.newlines |= mask(b'\n' as i8) << offset;
++        }
++        m
++    }
++}
++
++pub(super) fn visit(text: &str, visit_row: impl FnMut([&str; 7])) {
++    #[cfg(target_arch = "x86_64")]
++    {
++        if is_x86_feature_detected!("avx2") {
++            scan(text, |block| unsafe { x86::avx2(block) }, visit_row);
++        } else {
++            scan(text, x86::sse2, visit_row);
++        }
++    }
++    #[cfg(not(target_arch = "x86_64"))]
++    scan(text, classify, visit_row);
++}
++
++fn decode(line: &str, mut commas: u128, mut quotes: u128) -> Option<[&str; 7]> {
++    commas |= 1 << line.len();
++    let mut row = [""; 7];
++    let mut start = 0;
++    for field in &mut row {
++        if commas == 0 {
++            return None;
++        }
++        let end = commas.trailing_zeros() as usize;
++        commas &= commas - 1;
++        let left = 1 << start;
++        *field = if quotes & left == 0 {
++            &line[start..end]
++        } else {
++            if end < start + 2 {
++                return None;
++            }
++            let right = 1 << (end - 1);
++            if quotes & right == 0 {
++                return None;
++            }
++            quotes ^= left | right;
++            &line[start + 1..end - 1]
++        };
++        start = end + 1;
++    }
++    (commas == 0 && quotes == 0).then_some(row)
++}
++
++// Each input block is classified once. Masks for an unfinished short row
++// carry into the next block. Long rows use the general parser on borrowed text.
++fn scan(
++    text: &str,
++    classify: impl Fn(&[u8; WIDTH]) -> Masks,
++    mut visit_row: impl FnMut([&str; 7]),
++) {
++    let mut row_start = 0;
++    let mut prior_commas = 0;
++    let mut prior_quotes = 0;
++    for (index, block) in text.as_bytes().chunks(WIDTH).enumerate() {
++        let base = index * WIDTH;
++        let masks = if let Ok(full) = block.try_into() {
++            classify(full)
++        } else {
++            let mut tail = [0; WIDTH];
++            tail[..block.len()].copy_from_slice(block);
++            classify(&tail)
++        };
++        let mut newlines = masks.newlines;
++        let mut local_start = 0;
++        while newlines != 0 {
++            let end = newlines.trailing_zeros() as usize;
++            newlines &= newlines - 1;
++            let line = &text[row_start..base + end];
++            let row = if line.len() <= MAX_INLINE_ROW {
++                let before_end = (1u64 << end) - 1;
++                let prior = base + local_start - row_start;
++                let commas = (masks.commas & before_end) >> local_start;
++                let quotes = (masks.quotes & before_end) >> local_start;
++                decode(
++                    line,
++                    prior_commas | (u128::from(commas) << prior),
++                    prior_quotes | (u128::from(quotes) << prior),
++                )
++            } else {
++                fields(line)
++            };
++            if let Some(row) = row {
++                visit_row(row);
++            }
++            local_start = end + 1;
++            row_start = base + local_start;
++            prior_commas = 0;
++            prior_quotes = 0;
++        }
++        if local_start < block.len() && base + block.len() - row_start <= MAX_INLINE_ROW {
++            let prior = base + local_start - row_start;
++            prior_commas |= u128::from(masks.commas >> local_start) << prior;
++            prior_quotes |= u128::from(masks.quotes >> local_start) << prior;
++        }
++    }
++}
+--- a/src/csv.rs
++++ b/src/csv.rs
+@@ -1,5 +1,5 @@
+ use std::fs::{self, File};
+-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
++use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+ use std::path::{Path, PathBuf};
+ 
+ const CHUNK_BYTES: u64 = 4 << 20;
+@@ -144,11 +144,102 @@
+         }
+         Ok(())
+     }
+-}
++
++    pub fn read_events(&self, visit: impl FnMut([&str; 7])) -> io::Result<()> {
++        let mut reader = BufReader::new(File::open(&self.path)?);
++        let mut pos = self.start.saturating_sub(1);
++        reader.seek(SeekFrom::Start(pos))?;
++        pos += reader.skip_until(b'\n')? as u64;
++        if pos >= self.end {
++            return Ok(());
++        }
++        let limit = self.end - pos;
++        let mut bytes = Vec::with_capacity(limit as usize + 128);
++        reader.by_ref().take(limit).read_to_end(&mut bytes)?;
++        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
++            // The chunk owns the row that started before its end, including its tail.
++            reader.read_until(b'\n', &mut bytes)?;
++            if bytes.last() != Some(&b'\n') {
++                bytes.push(b'\n');
++            }
++        }
++        let text = std::str::from_utf8(&bytes)
++            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
++        event_scan::visit(text, visit);
++        Ok(())
++    }
++}
++
++mod event_scan;
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{fields, split_fields};
++    use super::{Chunk, event_scan, fields, split_fields};
++
++    #[test]
++    fn event_masks_match_general_fields_at_block_and_row_edges() {
++        let mut input = String::new();
++        for pad in 0..=132 {
++            for tail in [
++                "",
++                "x",
++                "\r",
++                "é",
++                "\"\"",
++                "\"quoted\"",
++                "\"bad",
++                "bad\"",
++                "\"a\"b\"",
++                "a,b",
++            ] {
++                input.push_str(&format!("e,{},0,utc,\"view\",日,{tail}\n", "u".repeat(pad)));
++            }
++        }
++        input.push_str("\nwrong\n,,,\n,,,\"comma,inside\",,,\n");
++        let expected: Vec<_> = input
++            .split_terminator('\n')
++            .filter_map(split_fields::<7>)
++            .map(|row| row.map(str::to_owned))
++            .collect();
++        let mut actual = Vec::new();
++        event_scan::visit(&input, |row| actual.push(row.map(str::to_owned)));
++        assert_eq!(expected, actual);
++    }
++
++    #[test]
++    fn event_chunks_preserve_header_ownership_and_unterminated_tail() -> std::io::Result<()> {
++        use std::{
++            fs,
++            time::{SystemTime, UNIX_EPOCH},
++        };
++        let input = "h1,h2,h3,h4,h5,h6,h7\ne,u,1,2,view,p,\n\nq,\"日\",3,4,cart,\"p\",bad\r\ns,u,5,6,purchase,p,7\r";
++        let salt = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_nanos();
++        let path =
++            std::env::temp_dir().join(format!("event-scan-{}-{salt}.csv", std::process::id()));
++        fs::write(&path, input)?;
++        let expected: Vec<_> = input
++            .split('\n')
++            .skip(1)
++            .filter_map(split_fields::<7>)
++            .map(|row| row.map(str::to_owned))
++            .collect();
++        for split in 0..=input.len() as u64 {
++            let mut actual = Vec::new();
++            for (start, end) in [(0, split), (split, input.len() as u64)] {
++                Chunk {
++                    path: path.clone(),
++                    start,
++                    end,
++                }
++                .read_events(|row| actual.push(row.map(str::to_owned)))?;
++            }
++            assert_eq!(actual, expected, "split at byte {split}");
++        }
++        fs::remove_file(path)
++    }
+ 
+     #[test]
+     fn short_rows_match_the_general_parser_at_block_edges() {
+--- a/src/identity.rs
++++ b/src/identity.rs
+@@ -112,13 +112,13 @@
+ }
+ 
+ const SHARDS: usize = 64;
+-const DIRECT: Person = 1 << (usize::BITS - 1);
++pub(crate) const DIRECT: Person = 1 << (usize::BITS - 1);
+ const ASCII_BITS: u32 = 7;
+ const MAX_DIRECT_LEN: usize = ((usize::BITS - 1) / ASCII_BITS) as usize;
+ const ASCII_MASK: usize = (1 << ASCII_BITS) - 1;
+ 
+ // A nonzero first byte lets the decoder recover the original length, including trailing NULs.
+-fn direct_person(id: &str) -> Option<Person> {
++pub(crate) fn direct_person(id: &str) -> Option<Person> {
+     let bytes = id.as_bytes();
+     if bytes.len() > MAX_DIRECT_LEN || bytes.first().is_none_or(|&b| b == 0) || !bytes.is_ascii() {
+         return None;
+@@ -144,16 +144,20 @@
+         if person & DIRECT == 0 {
+             return use_name(&self.0[person]);
+         }
+-        let mut bytes = [0u8; MAX_DIRECT_LEN];
+-        let mut pos = bytes.len();
+-        let mut bits = person & !DIRECT;
+-        while bits != 0 {
+-            pos -= 1;
+-            bytes[pos] = (bits & ASCII_MASK) as u8;
+-            bits >>= ASCII_BITS;
+-        }
+-        use_name(std::str::from_utf8(&bytes[pos..]).unwrap())
+-    }
++        with_direct_name(person, use_name)
++    }
++}
++
++pub(crate) fn with_direct_name<T>(person: Person, use_name: impl FnOnce(&str) -> T) -> T {
++    let mut bytes = [0u8; MAX_DIRECT_LEN];
++    let mut pos = bytes.len();
++    let mut bits = person & !DIRECT;
++    while bits != 0 {
++        pos -= 1;
++        bytes[pos] = (bits & ASCII_MASK) as u8;
++        bits >>= ASCII_BITS;
++    }
++    use_name(std::str::from_utf8(&bytes[pos..]).unwrap())
+ }
+ 
+ impl People {
+--- /dev/null
++++ b/src/input/grouped.rs
+@@ -0,0 +1,413 @@
++use super::{Batches, EventId, Lookups, OwnedEvent, RepeatFilter, buckets, mix_id, regroup};
++use crate::{
++    Result,
++    csv::chunks,
++    identity::{DIRECT, People, direct_person, with_direct_name},
++    model::{Event, Person},
++    time::timestamp,
++};
++use rayon::prelude::*;
++use std::{
++    collections::HashMap,
++    hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
++    io,
++    path::Path,
++    sync::atomic::{AtomicU32, Ordering},
++};
++
++const SIDE: u32 = 1 << 31;
++const NO_PAYLOAD: u32 = u32::MAX;
++const DEAD: u32 = u32::MAX;
++const WIDE_EVENT: u32 = 0xff00_0000;
++const PRICE_MASK: u32 = 0x00ff_ffff;
++const ORDER_BIAS: i64 = 1 << 30;
++
++#[derive(Clone, Copy)]
++struct Location {
++    order: u32,
++    position: u32,
++}
++
++struct Version {
++    key: u64,
++    at: Location,
++}
++
++#[derive(Default)]
++struct VersionBin {
++    inline: Vec<Version>,
++    text: Vec<(Box<str>, Location)>,
++}
++
++struct Payload {
++    alias: usize,
++    millis: u32,
++    details: AtomicU32,
++}
++
++const _: () = assert!(size_of::<Version>() == 16);
++const _: () = assert!(size_of::<Payload>() == 16);
++
++struct EventChunk {
++    versions: Vec<VersionBin>,
++    payloads: Vec<Vec<Payload>>,
++    aliases: Vec<Box<str>>,
++    wide_events: Vec<Event>,
++    wide_orders: Vec<i64>,
++    wide_positions: Vec<(usize, usize)>,
++    shift: u32,
++}
++
++impl EventChunk {
++    fn new(shards: usize) -> Self {
++        debug_assert!(shards.is_power_of_two());
++        Self {
++            versions: (0..shards).map(|_| VersionBin::default()).collect(),
++            payloads: buckets(shards),
++            aliases: Vec::new(),
++            wide_events: Vec::new(),
++            wide_orders: Vec::new(),
++            wide_positions: Vec::new(),
++            shift: shards.ilog2(),
++        }
++    }
++
++    fn add_payload(&mut self, user: &str, event: Event, start: i64) -> u32 {
++        let (alias, hash) = if let Some(key) = direct_person(user) {
++            (key, mix_id(key as u64))
++        } else {
++            let index = self.aliases.len();
++            self.aliases.push(user.into());
++            let mut h = DefaultHasher::new();
++            user.hash(&mut h);
++            (index, h.finish())
++        };
++        let delta = event
++            .ts
++            .checked_sub(start)
++            .and_then(|t| u32::try_from(t).ok());
++        let (millis, details) = if let Some(t) = delta
++            && event.category < 255
++        {
++            debug_assert!((0..=i64::from(PRICE_MASK)).contains(&event.cents));
++            (t, ((event.category as u32) << 24) | event.cents as u32)
++        } else {
++            // Each chunk covers at most 4 MiB, too few rows to exhaust 24 bits.
++            let index = self.wide_events.len();
++            assert!(index < PRICE_MASK as usize);
++            self.wide_events.push(event);
++            (0, WIDE_EVENT | index as u32)
++        };
++        let shard = hash as usize & (self.payloads.len() - 1);
++        let pos = self.payloads[shard].len();
++        self.payloads[shard].push(Payload {
++            alias,
++            millis,
++            details: AtomicU32::new(details),
++        });
++        if let Some(n) = pos
++            .checked_mul(self.payloads.len())
++            .and_then(|n| n.checked_add(shard))
++            && n < SIDE as usize
++        {
++            n as u32
++        } else {
++            let index = self.wide_positions.len();
++            self.wide_positions.push((shard, pos));
++            SIDE | index as u32
++        }
++    }
++
++    fn add(&mut self, id: &str, ingest: i64, user: &str, event: Option<Event>, start: i64) {
++        let position = event.map_or(NO_PAYLOAD, |e| self.add_payload(user, e, start));
++        let relative = ingest.div_euclid(1000) - start.div_euclid(1000) + ORDER_BIAS;
++        let order = if ingest.rem_euclid(1000) == 0 && (0..i64::from(SIDE)).contains(&relative) {
++            relative as u32
++        } else {
++            let index = self.wide_orders.len();
++            self.wide_orders.push(ingest);
++            SIDE | index as u32
++        };
++        let key = EventId::from(id);
++        let shard = key.shard(self.versions.len());
++        let at = Location { order, position };
++        match key {
++            EventId::Short(key) => self.versions[shard].inline.push(Version { key, at }),
++            EventId::Text(key) => self.versions[shard].text.push((key, at)),
++        }
++    }
++
++    fn ingest(&self, order: u32, start: i64) -> i64 {
++        if order & SIDE == 0 {
++            (start.div_euclid(1000) + i64::from(order) - ORDER_BIAS) * 1000
++        } else {
++            self.wide_orders[(order & !SIDE) as usize]
++        }
++    }
++
++    fn mark_loser(&self, pos: u32) {
++        if pos == NO_PAYLOAD {
++            return;
++        }
++        let (bin, offset) = if pos & SIDE == 0 {
++            (
++                pos as usize & (self.payloads.len() - 1),
++                (pos >> self.shift) as usize,
++            )
++        } else {
++            self.wide_positions[(pos & !SIDE) as usize]
++        };
++        self.payloads[bin][offset]
++            .details
++            .store(DEAD, Ordering::Relaxed);
++    }
++
++    fn event(&self, p: &Payload, start: i64) -> Option<Event> {
++        let details = p.details.load(Ordering::Relaxed);
++        if details == DEAD {
++            None
++        } else if details & WIDE_EVENT == WIDE_EVENT {
++            let wide = &self.wide_events[(details & PRICE_MASK) as usize];
++            Some(Event {
++                ts: wide.ts,
++                cents: wide.cents,
++                category: wide.category,
++            })
++        } else {
++            Some(Event {
++                ts: start + i64::from(p.millis),
++                cents: i64::from(details & PRICE_MASK),
++                category: (details >> 24) as usize,
++            })
++        }
++    }
++}
++
++fn event_read(data: &Path, refs: &Lookups, shards: usize) -> io::Result<Vec<EventChunk>> {
++    chunks(&data.join("events"))?
++        .par_iter()
++        .map(|chunk| {
++            let mut part = EventChunk::new(shards);
++            chunk.read_events(|row| {
++                if row[0].is_empty() {
++                    return;
++                }
++                let Some(ingest) = timestamp(row[3]) else {
++                    return;
++                };
++                part.add(row[0], ingest, row[1], refs.event(&row, ingest), refs.start);
++            })?;
++            Ok(part)
++        })
++        .collect()
++}
++
++fn remember<K: Eq + Hash>(
++    earliest: &mut HashMap<K, (i64, usize, u32)>,
++    key: K,
++    part: usize,
++    at: Location,
++    chunks: &[EventChunk],
++    start: i64,
++) {
++    use std::collections::hash_map::Entry;
++    let time = chunks[part].ingest(at.order, start);
++    match earliest.entry(key) {
++        Entry::Vacant(e) => {
++            e.insert((time, part, at.position));
++        }
++        Entry::Occupied(mut e) => {
++            let (old, owner, pos) = *e.get();
++            if time < old {
++                chunks[owner].mark_loser(pos);
++                e.insert((time, part, at.position));
++            } else {
++                chunks[part].mark_loser(at.position);
++            }
++        }
++    }
++}
++
++fn remove_duplicates(bins: Vec<(usize, VersionBin)>, chunks: &[EventChunk], start: i64) {
++    let mut filter = RepeatFilter::new(bins.iter().map(|(_, b)| b.inline.len()).sum());
++    for (_, bin) in &bins {
++        for v in &bin.inline {
++            filter.record(v.key);
++        }
++    }
++    let mut short = HashMap::new();
++    let mut text = HashMap::new();
++    for (part, bin) in bins {
++        for v in bin.inline {
++            if filter.might_repeat(v.key) {
++                remember(&mut short, v.key, part, v.at, chunks, start);
++            }
++        }
++        for (key, at) in bin.text {
++            remember(&mut text, key, part, at, chunks, start);
++        }
++    }
++}
++
++#[derive(Default)]
++struct AliasHash(u64);
++
++impl Hasher for AliasHash {
++    fn write(&mut self, b: &[u8]) {
++        let mut h = DefaultHasher::new();
++        h.write(b);
++        self.0 = h.finish();
++    }
++
++    fn write_usize(&mut self, key: usize) {
++        // Low bits of mix_id were already used to select the raw shopper shard.
++        self.0 = mix_id(key as u64).rotate_right(32);
++    }
++
++    fn finish(&self) -> u64 {
++        self.0
++    }
++}
++
++fn route_shoppers(
++    shard: usize,
++    chunks: &[EventChunk],
++    start: i64,
++    groups: usize,
++    mut resolve: impl FnMut(&str) -> Person,
++) -> Vec<Vec<OwnedEvent>> {
++    let mut inline = HashMap::<usize, Person, BuildHasherDefault<AliasHash>>::default();
++    let mut text = HashMap::<&str, Person>::new();
++    let mut out = buckets(groups);
++    for chunk in chunks {
++        for p in &chunk.payloads[shard] {
++            let Some(event) = chunk.event(p, start) else {
++                continue;
++            };
++            let person = if p.alias & DIRECT != 0 {
++                *inline
++                    .entry(p.alias)
++                    .or_insert_with(|| with_direct_name(p.alias, &mut resolve))
++            } else {
++                let id = &*chunk.aliases[p.alias];
++                *text.entry(id).or_insert_with(|| resolve(id))
++            };
++            out[person % groups].push((person, event));
++        }
++    }
++    out
++}
++
++fn finish(
++    mut scanned: Vec<EventChunk>,
++    groups: usize,
++    start: i64,
++    people: &People,
++) -> Batches<OwnedEvent> {
++    let shards = groups.next_power_of_two();
++    let mut versions = buckets(shards);
++    for (owner, part) in scanned.iter_mut().enumerate() {
++        for (shard, bin) in std::mem::take(&mut part.versions).into_iter().enumerate() {
++            versions[shard].push((owner, bin));
++        }
++    }
++    versions
++        .into_par_iter()
++        .for_each(|bins| remove_duplicates(bins, &scanned, start));
++    let out = (0..shards)
++        .into_par_iter()
++        .map(|shard| route_shoppers(shard, &scanned, start, groups, |id| people.resolve(id)))
++        .collect();
++    regroup(out, groups)
++}
++
++pub fn events(
++    data: &Path,
++    people: &People,
++    refs: &Lookups,
++    count: usize,
++) -> Result<Batches<OwnedEvent>> {
++    let scanned = event_read(data, refs, count.next_power_of_two())?;
++    Ok(finish(scanned, count, refs.start, people))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn detail(ts: i64, category: usize) -> Option<Event> {
++        Some(Event {
++            ts,
++            category,
++            cents: 10_000_000,
++        })
++    }
++
++    #[test]
++    fn mark_losing_payloads_across_shoppers_then_resolve_each_raw_alias_once() {
++        let mut chunks = vec![EventChunk::new(1), EventChunk::new(1)];
++        let start = 12_345;
++        let wide = 8_000_000_000_000;
++        let rare_alias = "\0long alias é";
++        chunks[0].add("e00000001", 2000, "later", detail(start + 11, 0), start);
++        chunks[1].add("e00000001", 1000, "broken", None, start);
++        chunks[1].add("e00000002", 3000, "u1", detail(start + 12, 254), start);
++        chunks[0].add("e00000003", 1000, "u1", detail(start + 13, 0), start);
++        chunks[1].add("rare\0event", 1111, rare_alias, detail(wide, 300), start);
++        chunks[0].add("rare\0event", wide, "other", detail(start + 1, 0), start);
++        chunks[0].add("E00000003", 2000, rare_alias, detail(start + 14, 2), start);
++        let bins: Vec<_> = chunks
++            .iter_mut()
++            .enumerate()
++            .map(|(i, c)| (i, c.versions.pop().unwrap()))
++            .collect();
++        remove_duplicates(bins, &chunks, start);
++        let mut lookups = Vec::new();
++        let mut events: Vec<_> = route_shoppers(0, &chunks, start, 3, |name| {
++            lookups.push(name.to_owned());
++            2
++        })
++        .into_iter()
++        .flatten()
++        .map(|(_, e)| (e.ts, e.category, e.cents))
++        .collect();
++        lookups.sort_unstable();
++        events.sort_unstable();
++        assert_eq!(lookups, [rare_alias, "u1"]);
++        assert_eq!(
++            events,
++            [
++                (start + 12, 254, 10_000_000),
++                (start + 13, 0, 10_000_000),
++                (start + 14, 2, 10_000_000),
++                (wide, 300, 10_000_000),
++            ]
++        );
++    }
++
++    #[test]
++    fn compact_versions_keep_distinct_ids_that_share_a_filter_slot() {
++        let mut part = EventChunk::new(1);
++        let filter = RepeatFilter::new(2);
++        let first = "e00000000";
++        let EventId::Short(key) = EventId::from(first) else {
++            unreachable!()
++        };
++        let colliding = (1..10_000)
++            .map(|i| format!("e{i:08}"))
++            .find(|id| {
++                let EventId::Short(k) = EventId::from(id.as_str()) else {
++                    unreachable!()
++                };
++                filter.slot(k) == filter.slot(key)
++            })
++            .unwrap();
++        part.add(first, 1000, "A", detail(1000, 0), 0);
++        part.add(&colliding, 1000, "B", detail(1000, 0), 0);
++        let bins = vec![(0, part.versions.pop().unwrap())];
++        let chunks = vec![part];
++        remove_duplicates(bins, &chunks, 0);
++        let out = route_shoppers(0, &chunks, 0, 1, |_| 0);
++        assert_eq!(out[0].len(), 2);
++    }
++}
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -129,12 +129,6 @@
+     }
+ }
+ 
+-struct Candidate {
+-    id: EventId,
+-    ingest: i64,
+-    payload: Option<OwnedEvent>,
+-}
+-
+ // SplitMix64's finalizer spreads the eight ID bytes across the shard and filter bits.
+ fn mix_id(mut key: u64) -> u64 {
+     key = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+@@ -152,7 +146,8 @@
+                 h.finish()
+             }
+         };
+-        hash as usize % count
++        debug_assert!(count.is_power_of_two());
++        hash as usize & (count - 1)
+     }
+ }
+ 
+@@ -208,78 +203,8 @@
+     groups
+ }
+ 
+-fn deduplicate(parts: Vec<Vec<Candidate>>, count: usize) -> Vec<Vec<OwnedEvent>> {
+-    let mut filter = RepeatFilter::new(parts.iter().map(Vec::len).sum());
+-    for c in parts.iter().flatten() {
+-        if let EventId::Short(key) = c.id {
+-            filter.record(key);
+-        }
+-    }
+-    let mut earliest = HashMap::new();
+-    let mut out = buckets(count);
+-    let mut emit = |payload: Option<OwnedEvent>| {
+-        if let Some((person, event)) = payload {
+-            out[person % count].push((person, event));
+-        }
+-    };
+-    for c in parts.into_iter().flatten() {
+-        if let EventId::Short(key) = c.id
+-            && !filter.might_repeat(key)
+-        {
+-            emit(c.payload);
+-            continue;
+-        }
+-        let slot = earliest.entry(c.id).or_insert((i64::MAX, None));
+-        if c.ingest < slot.0 {
+-            *slot = (c.ingest, c.payload);
+-        }
+-    }
+-    for (_, payload) in earliest.into_values() {
+-        emit(payload);
+-    }
+-    out
+-}
+-
+-pub fn events(
+-    data: &Path,
+-    people: &People,
+-    refs: &Lookups,
+-    count: usize,
+-) -> Result<Batches<OwnedEvent>> {
+-    let batches: Batches<Candidate> = chunks(&data.join("events"))?
+-        .par_iter()
+-        .map(|chunk| {
+-            let mut out = buckets(count);
+-            chunk.read(|line| {
+-                let Some(row) = fields::<7>(line) else {
+-                    return;
+-                };
+-                if row[0].is_empty() {
+-                    return;
+-                }
+-                let Some(ingest) = timestamp(row[3]) else {
+-                    return;
+-                };
+-                // Invalid copies still compete for earliest ingestion.
+-                let payload = refs
+-                    .event(&row, ingest)
+-                    .map(|event| (people.resolve(row[1]), event));
+-                let id = EventId::from(row[0]);
+-                out[id.shard(count)].push(Candidate {
+-                    id,
+-                    ingest,
+-                    payload,
+-                });
+-            })?;
+-            Ok::<_, io::Error>(out)
+-        })
+-        .collect::<io::Result<_>>()?;
+-    let winners = regroup(batches, count)
+-        .into_par_iter()
+-        .map(|parts| deduplicate(parts, count))
+-        .collect();
+-    Ok(regroup(winners, count))
+-}
++mod grouped;
++pub use grouped::events;
+ 
+ pub fn clicks(
+     data: &Path,
+@@ -323,7 +248,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{Candidate, Event, EventId, RepeatFilter, deduplicate};
++    use super::EventId;
+     use std::collections::HashSet;
+ 
+     #[test]
+@@ -341,45 +266,4 @@
+         let keys: HashSet<_> = ids.into_iter().map(EventId::from).collect();
+         assert_eq!(keys.len(), 7);
+     }
+-
+-    #[test]
+-    fn collisions_keep_distinct_ids_and_invalid_early_copies_win_across_batches() {
+-        let filter = RepeatFilter::new(6);
+-        let colliding = (1..)
+-            .find(|&key| filter.slot(key) == filter.slot(0))
+-            .unwrap();
+-        let candidate = |id, ingest, shopper: Option<usize>| Candidate {
+-            id,
+-            ingest,
+-            payload: shopper.map(|person| {
+-                (
+-                    person,
+-                    Event {
+-                        ts: 0,
+-                        cents: 0,
+-                        category: 0,
+-                    },
+-                )
+-            }),
+-        };
+-        let parts = vec![
+-            vec![
+-                candidate(EventId::Short(0), 2, Some(10)),
+-                candidate(EventId::Short(colliding), 1, Some(20)),
+-                candidate(EventId::from("long event ID"), 3, Some(30)),
+-            ],
+-            vec![
+-                candidate(EventId::Short(0), 1, None),
+-                candidate(EventId::from("long event ID"), 2, Some(40)),
+-                candidate(EventId::Short(1 + colliding), 1, Some(50)),
+-            ],
+-        ];
+-        let mut people: Vec<_> = deduplicate(parts, 3)
+-            .into_iter()
+-            .flatten()
+-            .map(|(person, _)| person)
+-            .collect();
+-        people.sort_unstable();
+-        assert_eq!(people, [20, 40, 50]);
+-    }
+-}
++}

@@ -1,0 +1,3 @@
+round,position,variant,reader,elapsed_s,event_read_s,click_read_s,event_scan_and_route_s,setup_s,input_and_dedup_s,reports_write_s,peak_bytes,records
+2,1,combined,event,1.412516,,,,,,,,21582714
+2,2,grouped,event,1.722398,,,,,,,,21582714

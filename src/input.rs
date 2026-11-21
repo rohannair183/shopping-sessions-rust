@@ -129,12 +129,6 @@ impl From<&str> for EventId {
     }
 }
 
-struct Candidate {
-    id: EventId,
-    ingest: i64,
-    payload: Option<OwnedEvent>,
-}
-
 // SplitMix64's finalizer spreads the eight ID bytes across the shard and filter bits.
 fn mix_id(mut key: u64) -> u64 {
     key = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -152,7 +146,8 @@ impl EventId {
                 h.finish()
             }
         };
-        hash as usize % count
+        debug_assert!(count.is_power_of_two());
+        hash as usize & (count - 1)
     }
 }
 
@@ -208,78 +203,8 @@ fn regroup<T>(batches: Batches<T>, count: usize) -> Batches<T> {
     groups
 }
 
-fn deduplicate(parts: Vec<Vec<Candidate>>, count: usize) -> Vec<Vec<OwnedEvent>> {
-    let mut filter = RepeatFilter::new(parts.iter().map(Vec::len).sum());
-    for c in parts.iter().flatten() {
-        if let EventId::Short(key) = c.id {
-            filter.record(key);
-        }
-    }
-    let mut earliest = HashMap::new();
-    let mut out = buckets(count);
-    let mut emit = |payload: Option<OwnedEvent>| {
-        if let Some((person, event)) = payload {
-            out[person % count].push((person, event));
-        }
-    };
-    for c in parts.into_iter().flatten() {
-        if let EventId::Short(key) = c.id
-            && !filter.might_repeat(key)
-        {
-            emit(c.payload);
-            continue;
-        }
-        let slot = earliest.entry(c.id).or_insert((i64::MAX, None));
-        if c.ingest < slot.0 {
-            *slot = (c.ingest, c.payload);
-        }
-    }
-    for (_, payload) in earliest.into_values() {
-        emit(payload);
-    }
-    out
-}
-
-pub fn events(
-    data: &Path,
-    people: &People,
-    refs: &Lookups,
-    count: usize,
-) -> Result<Batches<OwnedEvent>> {
-    let batches: Batches<Candidate> = chunks(&data.join("events"))?
-        .par_iter()
-        .map(|chunk| {
-            let mut out = buckets(count);
-            chunk.read(|line| {
-                let Some(row) = fields::<7>(line) else {
-                    return;
-                };
-                if row[0].is_empty() {
-                    return;
-                }
-                let Some(ingest) = timestamp(row[3]) else {
-                    return;
-                };
-                // Invalid copies still compete for earliest ingestion.
-                let payload = refs
-                    .event(&row, ingest)
-                    .map(|event| (people.resolve(row[1]), event));
-                let id = EventId::from(row[0]);
-                out[id.shard(count)].push(Candidate {
-                    id,
-                    ingest,
-                    payload,
-                });
-            })?;
-            Ok::<_, io::Error>(out)
-        })
-        .collect::<io::Result<_>>()?;
-    let winners = regroup(batches, count)
-        .into_par_iter()
-        .map(|parts| deduplicate(parts, count))
-        .collect();
-    Ok(regroup(winners, count))
-}
+mod grouped;
+pub use grouped::events;
 
 pub fn clicks(
     data: &Path,
@@ -323,7 +248,7 @@ pub fn clicks(
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, Event, EventId, RepeatFilter, deduplicate};
+    use super::EventId;
     use std::collections::HashSet;
 
     #[test]
@@ -340,46 +265,5 @@ mod tests {
         ];
         let keys: HashSet<_> = ids.into_iter().map(EventId::from).collect();
         assert_eq!(keys.len(), 7);
-    }
-
-    #[test]
-    fn collisions_keep_distinct_ids_and_invalid_early_copies_win_across_batches() {
-        let filter = RepeatFilter::new(6);
-        let colliding = (1..)
-            .find(|&key| filter.slot(key) == filter.slot(0))
-            .unwrap();
-        let candidate = |id, ingest, shopper: Option<usize>| Candidate {
-            id,
-            ingest,
-            payload: shopper.map(|person| {
-                (
-                    person,
-                    Event {
-                        ts: 0,
-                        cents: 0,
-                        category: 0,
-                    },
-                )
-            }),
-        };
-        let parts = vec![
-            vec![
-                candidate(EventId::Short(0), 2, Some(10)),
-                candidate(EventId::Short(colliding), 1, Some(20)),
-                candidate(EventId::from("long event ID"), 3, Some(30)),
-            ],
-            vec![
-                candidate(EventId::Short(0), 1, None),
-                candidate(EventId::from("long event ID"), 2, Some(40)),
-                candidate(EventId::Short(1 + colliding), 1, Some(50)),
-            ],
-        ];
-        let mut people: Vec<_> = deduplicate(parts, 3)
-            .into_iter()
-            .flatten()
-            .map(|(person, _)| person)
-            .collect();
-        people.sort_unstable();
-        assert_eq!(people, [20, 40, 50]);
     }
 }

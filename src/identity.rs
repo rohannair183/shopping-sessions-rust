@@ -112,13 +112,13 @@ impl Groups {
 }
 
 const SHARDS: usize = 64;
-const DIRECT: Person = 1 << (usize::BITS - 1);
+pub(crate) const DIRECT: Person = 1 << (usize::BITS - 1);
 const ASCII_BITS: u32 = 7;
 const MAX_DIRECT_LEN: usize = ((usize::BITS - 1) / ASCII_BITS) as usize;
 const ASCII_MASK: usize = (1 << ASCII_BITS) - 1;
 
 // A nonzero first byte lets the decoder recover the original length, including trailing NULs.
-fn direct_person(id: &str) -> Option<Person> {
+pub(crate) fn direct_person(id: &str) -> Option<Person> {
     let bytes = id.as_bytes();
     if bytes.len() > MAX_DIRECT_LEN || bytes.first().is_none_or(|&b| b == 0) || !bytes.is_ascii() {
         return None;
@@ -144,16 +144,20 @@ impl Names {
         if person & DIRECT == 0 {
             return use_name(&self.0[person]);
         }
-        let mut bytes = [0u8; MAX_DIRECT_LEN];
-        let mut pos = bytes.len();
-        let mut bits = person & !DIRECT;
-        while bits != 0 {
-            pos -= 1;
-            bytes[pos] = (bits & ASCII_MASK) as u8;
-            bits >>= ASCII_BITS;
-        }
-        use_name(std::str::from_utf8(&bytes[pos..]).unwrap())
+        with_direct_name(person, use_name)
     }
+}
+
+pub(crate) fn with_direct_name<T>(person: Person, use_name: impl FnOnce(&str) -> T) -> T {
+    let mut bytes = [0u8; MAX_DIRECT_LEN];
+    let mut pos = bytes.len();
+    let mut bits = person & !DIRECT;
+    while bits != 0 {
+        pos -= 1;
+        bytes[pos] = (bits & ASCII_MASK) as u8;
+        bits >>= ASCII_BITS;
+    }
+    use_name(std::str::from_utf8(&bytes[pos..]).unwrap())
 }
 
 impl People {

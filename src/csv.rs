@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 const CHUNK_BYTES: u64 = 4 << 20;
@@ -144,11 +144,102 @@ impl Chunk {
         }
         Ok(())
     }
+
+    pub fn read_events(&self, visit: impl FnMut([&str; 7])) -> io::Result<()> {
+        let mut reader = BufReader::new(File::open(&self.path)?);
+        let mut pos = self.start.saturating_sub(1);
+        reader.seek(SeekFrom::Start(pos))?;
+        pos += reader.skip_until(b'\n')? as u64;
+        if pos >= self.end {
+            return Ok(());
+        }
+        let limit = self.end - pos;
+        let mut bytes = Vec::with_capacity(limit as usize + 128);
+        reader.by_ref().take(limit).read_to_end(&mut bytes)?;
+        if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+            // The chunk owns the row that started before its end, including its tail.
+            reader.read_until(b'\n', &mut bytes)?;
+            if bytes.last() != Some(&b'\n') {
+                bytes.push(b'\n');
+            }
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        event_scan::visit(text, visit);
+        Ok(())
+    }
 }
+
+mod event_scan;
 
 #[cfg(test)]
 mod tests {
-    use super::{fields, split_fields};
+    use super::{Chunk, event_scan, fields, split_fields};
+
+    #[test]
+    fn event_masks_match_general_fields_at_block_and_row_edges() {
+        let mut input = String::new();
+        for pad in 0..=132 {
+            for tail in [
+                "",
+                "x",
+                "\r",
+                "é",
+                "\"\"",
+                "\"quoted\"",
+                "\"bad",
+                "bad\"",
+                "\"a\"b\"",
+                "a,b",
+            ] {
+                input.push_str(&format!("e,{},0,utc,\"view\",日,{tail}\n", "u".repeat(pad)));
+            }
+        }
+        input.push_str("\nwrong\n,,,\n,,,\"comma,inside\",,,\n");
+        let expected: Vec<_> = input
+            .split_terminator('\n')
+            .filter_map(split_fields::<7>)
+            .map(|row| row.map(str::to_owned))
+            .collect();
+        let mut actual = Vec::new();
+        event_scan::visit(&input, |row| actual.push(row.map(str::to_owned)));
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn event_chunks_preserve_header_ownership_and_unterminated_tail() -> std::io::Result<()> {
+        use std::{
+            fs,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+        let input = "h1,h2,h3,h4,h5,h6,h7\ne,u,1,2,view,p,\n\nq,\"日\",3,4,cart,\"p\",bad\r\ns,u,5,6,purchase,p,7\r";
+        let salt = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("event-scan-{}-{salt}.csv", std::process::id()));
+        fs::write(&path, input)?;
+        let expected: Vec<_> = input
+            .split('\n')
+            .skip(1)
+            .filter_map(split_fields::<7>)
+            .map(|row| row.map(str::to_owned))
+            .collect();
+        for split in 0..=input.len() as u64 {
+            let mut actual = Vec::new();
+            for (start, end) in [(0, split), (split, input.len() as u64)] {
+                Chunk {
+                    path: path.clone(),
+                    start,
+                    end,
+                }
+                .read_events(|row| actual.push(row.map(str::to_owned)))?;
+            }
+            assert_eq!(actual, expected, "split at byte {split}");
+        }
+        fs::remove_file(path)
+    }
 
     #[test]
     fn short_rows_match_the_general_parser_at_block_edges() {
