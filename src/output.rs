@@ -68,7 +68,7 @@ pub fn users(path: &Path, rows: &[UserRow], refs: &Lookups, names: &Names) -> Re
         vec![
             Column::Text(
                 b.iter()
-                    .map(|r| ByteArray::from(names.get(r.person)))
+                    .map(|r| names.with_name(r.person, |name| ByteArray::from(name)))
                     .collect(),
                 None,
             ),

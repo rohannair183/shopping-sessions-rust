@@ -42,9 +42,9 @@ Input data, fixture datasets, expected answers, and run outputs are excluded fro
 
 - **Input:** `csv.rs` reads and checks CSV rows. `time.rs` parses timestamps. `identity.rs` gives each shopper one number across all linked IDs. `input.rs` stores common event IDs as eight bytes and keeps every other ID as text. It keeps the earliest copy across all chunks, even when that copy is invalid.
 - **Reports:** `report.rs` builds visits once per shopper. A forward scan gives credit to the latest eligible click. For assists, it counts only the visit starts a campaign has not already covered.
-- **Output:** `output.rs` looks up the original shopper name when writing Parquet. Linked shoppers use the smallest ID in their group. The pipeline writes shopper rows by partition and merges campaign counts across partitions.
+- **Output:** `output.rs` writes the original shopper name to Parquet. Linked shoppers use the smallest ID in their group. For short unlinked ASCII IDs, the writer recovers the name from the shopper key. The pipeline writes shopper rows by partition and merges campaign counts across partitions.
 
-The local runner defaults to six pinned vCPUs and 8 GiB without swap. It runs the Linux amd64 image with networking off, read-only input, a read-only root filesystem, and uid 1000. A native amd64 machine with sufficient resources can run `make run NCPU=8 MEM_GB=24 RUN=runs/native-dev`. The binary keeps intermediate records in memory and prints phase timings to stderr. Peak memory and final-size runtime have not been measured.
+The local runner defaults to six pinned vCPUs and 8 GiB without swap. It runs the Linux amd64 image with networking off, read-only input, a read-only root filesystem, and uid 1000. A native amd64 machine with sufficient resources can run `make run NCPU=8 MEM_GB=24 RUN=runs/native-dev`. The binary keeps intermediate records in memory and prints phase timings to stderr. Runtime and peak memory at final size have not been measured.
 
 ## Verified in this workspace
 
@@ -53,3 +53,5 @@ Both tables matched all 36 official fixtures. The public million-event run match
 On the local seed-7 practice dataset, the original program took 12.98 seconds, compact event IDs alone took 10.48 seconds, and both ID changes took 7.73 seconds. Each number is the median of three runs on six pinned Docker CPUs with an 8 GiB limit. The timer covers the program through writing both reports and excludes Docker startup. All 2,242,393 shopper rows and 28,014 campaign rows matched the original practice output.
 
 The [follow-up profile](docs/performance-profile.md) breaks down the remaining costs after the compact ID changes and compares four further optimizations.
+
+Using short unlinked shopper IDs directly as keys avoids a lock during event and click lookup. On the same seed-7 data, this cut the median from 6.03 seconds at `5cc01d1` to 5.52 seconds across six runs per build. Median peak container memory rose from 3.28 to 3.32 GiB. Both practice reports still matched.

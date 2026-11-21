@@ -112,6 +112,22 @@ impl Groups {
 }
 
 const SHARDS: usize = 64;
+const DIRECT: Person = 1 << (usize::BITS - 1);
+const ASCII_BITS: u32 = 7;
+const MAX_DIRECT_LEN: usize = ((usize::BITS - 1) / ASCII_BITS) as usize;
+const ASCII_MASK: usize = (1 << ASCII_BITS) - 1;
+
+// A nonzero first byte lets the decoder recover the original length, including trailing NULs.
+fn direct_person(id: &str) -> Option<Person> {
+    let bytes = id.as_bytes();
+    if bytes.len() > MAX_DIRECT_LEN || bytes.first().is_none_or(|&b| b == 0) || !bytes.is_ascii() {
+        return None;
+    }
+    let bits = bytes
+        .iter()
+        .fold(0, |bits, &b| (bits << ASCII_BITS) | usize::from(b));
+    Some(DIRECT | bits)
+}
 
 pub struct People {
     linked: Aliases,
@@ -124,8 +140,19 @@ pub struct People {
 pub struct Names(Vec<Box<str>>);
 
 impl Names {
-    pub fn get(&self, person: Person) -> &str {
-        &self.0[person]
+    pub fn with_name<T>(&self, person: Person, use_name: impl FnOnce(&str) -> T) -> T {
+        if person & DIRECT == 0 {
+            return use_name(&self.0[person]);
+        }
+        let mut bytes = [0u8; MAX_DIRECT_LEN];
+        let mut pos = bytes.len();
+        let mut bits = person & !DIRECT;
+        while bits != 0 {
+            pos -= 1;
+            bytes[pos] = (bits & ASCII_MASK) as u8;
+            bits >>= ASCII_BITS;
+        }
+        use_name(std::str::from_utf8(&bytes[pos..]).unwrap())
     }
 }
 
@@ -171,6 +198,9 @@ impl People {
     pub fn resolve(&self, id: &str) -> Person {
         let key = Key::from(id);
         if let Some(person) = self.linked.get(key) {
+            return person;
+        }
+        if let Some(person) = direct_person(id) {
             return person;
         }
         // All workers registering the same unlinked ID must choose the same shard.
@@ -228,7 +258,7 @@ mod tests {
         assert_eq!(results[0][0], results[0][1]);
         let names = people.into_names();
         assert_eq!(
-            results[0].map(|person| names.get(person)),
+            results[0].map(|person| names.with_name(person, str::to_owned)),
             [" unseen", " unseen", "é", "É", "é "]
         );
     }
@@ -243,7 +273,31 @@ mod tests {
         let inputs = ["é1234567", "É1234567", "é1234567 ", "a12345678"];
         let ids = inputs.map(|id| people.resolve(id));
         let names = people.into_names();
-        assert_eq!(names.get(canonical), "A12345678");
-        assert_eq!(ids.map(|id| names.get(id)), inputs);
+        assert_eq!(names.with_name(canonical, str::to_owned), "A12345678");
+        assert_eq!(ids.map(|id| names.with_name(id, str::to_owned)), inputs);
+    }
+
+    #[test]
+    fn direct_and_registered_names_remain_distinct() {
+        let people = People::from_groups(Groups::default());
+        let inputs = [
+            "u12345678",
+            "U12345678",
+            "u",
+            "u\0",
+            "\0u",
+            "é",
+            "u123456789",
+            " u ",
+        ];
+        let ids = inputs.map(|s| people.resolve(s));
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            inputs.len()
+        );
+        assert_ne!(people.resolve("u") & DIRECT, 0);
+        assert_eq!(people.resolve("\0u") & DIRECT, 0);
+        let names = people.into_names();
+        assert_eq!(ids.map(|id| names.with_name(id, str::to_owned)), inputs);
     }
 }
