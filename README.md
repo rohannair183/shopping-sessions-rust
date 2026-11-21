@@ -40,12 +40,14 @@ Input data, fixture datasets, expected answers, and run outputs are excluded fro
 
 ## Where to make changes
 
-- **Input:** `csv.rs` divides files into chunks and enforces the challenge CSV rules. `time.rs` parses timestamps. `identity.rs` links IDs across files. `input.rs` keeps the earliest copy of each event across all chunks, including invalid copies, before selecting survivors.
+- **Input:** `csv.rs` reads and checks CSV rows. `time.rs` parses timestamps. `identity.rs` gives each shopper one number across all linked IDs. `input.rs` stores common event IDs as eight bytes and keeps every other ID as text. It keeps the earliest copy across all chunks, even when that copy is invalid.
 - **Reports:** `report.rs` builds visits once per shopper. A forward scan gives credit to the latest eligible click. For assists, it counts only the visit starts a campaign has not already covered.
-- **Output:** `output.rs` writes typed Parquet columns. The pipeline writes shopper rows by partition and merges campaign counts across partitions.
+- **Output:** `output.rs` looks up the original shopper name when writing Parquet. Linked shoppers use the smallest ID in their group. The pipeline writes shopper rows by partition and merges campaign counts across partitions.
 
-The local runner defaults to six pinned vCPUs and 8 GiB without swap. It runs the Linux amd64 image with networking off, read-only input, a read-only root filesystem, and uid 1000. A native amd64 machine with sufficient resources can run `make run NCPU=8 MEM_GB=24 RUN=runs/native-dev`. The binary keeps intermediate records in memory and prints phase timings to stderr. Peak memory and runtime at practice and final size have not been measured.
+The local runner defaults to six pinned vCPUs and 8 GiB without swap. It runs the Linux amd64 image with networking off, read-only input, a read-only root filesystem, and uid 1000. A native amd64 machine with sufficient resources can run `make run NCPU=8 MEM_GB=24 RUN=runs/native-dev`. The binary keeps intermediate records in memory and prints phase timings to stderr. Peak memory and final-size runtime have not been measured.
 
 ## Verified in this workspace
 
 Both tables matched all 36 official fixtures. The public million-event run matched all 117,038 shopper rows and 27,400 campaign rows, including schema and values. The comparator found no missing rows, extra rows, or duplicate keys.
+
+On the local seed-7 practice dataset, the original program took 12.98 seconds, compact event IDs alone took 10.48 seconds, and both ID changes took 7.73 seconds. Each number is the median of three runs on six pinned Docker CPUs with an 8 GiB limit. The timer covers the program through writing both reports and excludes Docker startup. All 2,242,393 shopper rows and 28,014 campaign rows matched the original practice output.

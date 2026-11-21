@@ -33,7 +33,7 @@ pub fn shopper(
             .max_by(|(a, x), (b, y)| x.cmp(y).then_with(|| b.cmp(a)))
             .map(|(id, _)| id);
         rows.push(UserRow {
-            person: person.clone(),
+            person,
             day,
             sessions: stats.sessions,
             events: stats.events,

@@ -6,6 +6,7 @@ mod output;
 mod report;
 mod time;
 
+use identity::Names;
 use input::Lookups;
 use model::{CampaignDays, Click, Event, Person, Timeline};
 use rayon::prelude::*;
@@ -42,6 +43,7 @@ fn summarize(
     events: Vec<Vec<(Person, Event)>>,
     clicks: Vec<Vec<(Person, Click)>>,
     refs: &Lookups,
+    names: &Names,
     folder: &Path,
 ) -> Result<(usize, CampaignDays)> {
     let mut people: HashMap<Person, Timeline> = HashMap::new();
@@ -63,6 +65,7 @@ fn summarize(
             &folder.join(format!("part-{group:03}.parquet")),
             &rows,
             refs,
+            names,
         )?;
     }
     Ok((rows.len(), totals))
@@ -95,13 +98,13 @@ fn run() -> Result<()> {
         || input::clicks(&data, &people, &refs, groups),
     );
     let (events, clicks) = (events?, clicks?);
-    drop(people);
+    let names = people.into_names();
     let report_start = Instant::now();
     let parts: Vec<_> = events
         .into_par_iter()
         .zip(clicks)
         .enumerate()
-        .map(|(group, (e, c))| summarize(group, e, c, &refs, &user_folder))
+        .map(|(group, (e, c))| summarize(group, e, c, &refs, &names, &user_folder))
         .collect::<Result<_>>()?;
     let mut count = 0;
     let mut totals = CampaignDays::new();
@@ -112,7 +115,7 @@ fn run() -> Result<()> {
         }
     }
     if count == 0 {
-        output::users(&user_folder.join("part-000.parquet"), &[], &refs)?;
+        output::users(&user_folder.join("part-000.parquet"), &[], &refs, &names)?;
     }
     let campaigns = totals.len();
     output::campaigns(&campaign_folder.join("part-000.parquet"), totals, &refs)?;

@@ -1,5 +1,6 @@
 use crate::{
     Result,
+    identity::Names,
     input::Lookups,
     model::{CampaignDays, UserRow},
 };
@@ -62,12 +63,12 @@ fn table<T>(
     Ok(())
 }
 
-pub fn users(path: &Path, rows: &[UserRow], refs: &Lookups) -> Result<()> {
+pub fn users(path: &Path, rows: &[UserRow], refs: &Lookups, names: &Names) -> Result<()> {
     table(path, USER, rows, |b| {
         vec![
             Column::Text(
                 b.iter()
-                    .map(|r| ByteArray::from(r.person.as_ref()))
+                    .map(|r| ByteArray::from(names.get(r.person)))
                     .collect(),
                 None,
             ),

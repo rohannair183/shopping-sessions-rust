@@ -1,6 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
-pub type Person = Arc<str>;
+pub type Person = usize;
 
 pub struct Event {
     pub ts: i64,

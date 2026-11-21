@@ -106,8 +106,26 @@ impl Lookups {
 type Batches<T> = Vec<Vec<Vec<T>>>;
 type OwnedEvent = (Person, Event);
 type OwnedClick = (Person, Click);
+
+#[derive(PartialEq, Eq, Hash)]
+enum EventId {
+    Short(u64),
+    Text(Box<str>),
+}
+
+impl From<&str> for EventId {
+    fn from(id: &str) -> Self {
+        if let Some(tail) = id.strip_prefix('e')
+            && let Ok(bytes) = tail.as_bytes().try_into()
+        {
+            return Self::Short(u64::from_le_bytes(bytes));
+        }
+        Self::Text(id.into())
+    }
+}
+
 struct Candidate {
-    id: Box<str>,
+    id: EventId,
     ingest: i64,
     payload: Option<OwnedEvent>,
 }
@@ -157,7 +175,7 @@ pub fn events(
                 // Invalid copies still compete for earliest ingestion.
                 let payload = refs
                     .event(&row, ingest)
-                    .map(|event| (people.name(row[1]), event));
+                    .map(|event| (people.resolve(row[1]), event));
                 out[shard(row[0], count)].push(Candidate {
                     id: row[0].into(),
                     ingest,
@@ -179,8 +197,8 @@ pub fn events(
             }
             let mut out = buckets(count);
             for (_, (_, p)) in earliest {
-                if let Some((name, event)) = p {
-                    out[shard(&name, count)].push((name, event));
+                if let Some((person, event)) = p {
+                    out[person % count].push((person, event));
                 }
             }
             out
@@ -213,9 +231,9 @@ pub fn clicks(
                 if !(refs.start - WEEK..refs.end).contains(&ts) {
                     return;
                 }
-                let name = people.name(user);
-                out[shard(&name, count)].push((
-                    name,
+                let person = people.resolve(user);
+                out[person % count].push((
+                    person,
                     Click {
                         id: id.into(),
                         ts,
@@ -227,4 +245,26 @@ pub fn clicks(
         })
         .collect::<io::Result<_>>()?;
     Ok(regroup(batches, count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventId;
+    use std::collections::HashSet;
+
+    #[test]
+    fn duplicate_checks_preserve_every_byte_of_the_event_id() {
+        let ids = [
+            "e12345678",
+            "e12345678",
+            "E12345678",
+            "12345678",
+            "e12345678 ",
+            "e1234567",
+            "e123456é",
+            "e123456É",
+        ];
+        let keys: HashSet<_> = ids.into_iter().map(EventId::from).collect();
+        assert_eq!(keys.len(), 7);
+    }
 }
