@@ -59,3 +59,5 @@ Using short unlinked shopper IDs directly as keys avoids a lock during event and
 The default build combines direct shopper lookup with inline click IDs, shopper name reuse, and indexed campaign totals. In the [seed-7 benchmarks](docs/report-benchmarks.md), it cut the median whole job from 6.08 to 5.00 seconds. Against direct lookup plus inline clicks, it won four of eight back-to-back pairs.
 
 The event reader now scans CSV fields directly from each chunk and resolves the shopper once per distinct raw ID among surviving events. On seed 7, the combined reader took 1.01 seconds with all six workers. In six paired whole-job runs, adding the scanner to grouped lookup lowered the median from 4.32 to 4.04 seconds. See the [event reader benchmarks](docs/event-reader-experiments.md).
+
+The pipeline now reads events and removes duplicate copies while other workers build 32 shopper link tables. Clicks use the same chunk scanner as events and resolve shopper IDs after the link tables are ready. See the [combined release timings](docs/parallel-ingest.md).

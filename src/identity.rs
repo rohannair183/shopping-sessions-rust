@@ -2,6 +2,7 @@ use crate::{
     csv::{chunks, fields},
     model::Person,
 };
+use rayon::prelude::*;
 use std::{
     collections::HashMap,
     hash::{BuildHasher, RandomState},
@@ -71,35 +72,100 @@ impl Aliases {
     }
 }
 
+enum OwnedAlias {
+    Inline([u8; INLINE_LEN]),
+    Text(Box<str>),
+}
+
+impl OwnedAlias {
+    fn new(id: &str) -> Self {
+        match Key::from(id) {
+            Key::Inline(bytes) => Self::Inline(*bytes),
+            Key::Text(id) => Self::Text(id.into()),
+        }
+    }
+
+    fn key(&self) -> Key<'_> {
+        match self {
+            Self::Inline(bytes) => Key::Inline(bytes),
+            Self::Text(id) => Key::Text(id),
+        }
+    }
+}
+
+const LINK_PARTS: usize = 32;
+const _: () = assert!(LINK_PARTS.is_power_of_two() && LINK_PARTS > 1);
+
+fn link_part(id: &str) -> usize {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    const MIX: u64 = 0x9e3779b97f4a7c15;
+    let hash = if let Ok(bytes) = <&[u8; INLINE_LEN]>::try_from(id.as_bytes()) {
+        let tail = u64::from_le_bytes(bytes[1..].try_into().unwrap());
+        let bits = tail ^ u64::from(bytes[0]).wrapping_mul(MIX);
+        (bits ^ (bits >> 32)).wrapping_mul(MIX)
+    } else {
+        let mut h = DefaultHasher::new();
+        id.hash(&mut h);
+        h.finish()
+    };
+    (hash >> (64 - LINK_PARTS.ilog2())) as usize
+}
+
 #[derive(Default)]
-struct Groups {
-    ids: Aliases,
+struct LinkBatch {
+    rows: usize,
+    endpoints: [Vec<(OwnedAlias, usize)>; LINK_PARTS],
+}
+
+impl LinkBatch {
+    fn link(&mut self, left: &str, right: &str) {
+        for id in [left, right] {
+            self.endpoints[link_part(id)].push((OwnedAlias::new(id), self.rows));
+        }
+        self.rows += 1;
+    }
+}
+
+type LinkPiece = (usize, Vec<(OwnedAlias, usize)>);
+
+fn index_link_partition(pieces: Vec<LinkPiece>) -> (Aliases, Vec<(usize, usize)>) {
+    let mut aliases = Aliases::default();
+    let mut joins = Vec::new();
+    for (offset, endpoints) in pieces {
+        for (id, local) in endpoints {
+            let edge = offset + local;
+            let first = aliases.intern(id.key(), || edge);
+            if first != edge {
+                joins.push((first, edge));
+            }
+        }
+    }
+    (aliases, joins)
+}
+
+struct Forest {
     parent: Vec<usize>,
     size: Vec<usize>,
 }
 
-impl Groups {
-    fn index(&mut self, id: &str) -> usize {
-        let next = self.parent.len();
-        let index = self.ids.intern(Key::from(id), || next);
-        if index == next {
-            self.parent.push(next);
-            self.size.push(1);
+impl Forest {
+    fn new(edges: usize) -> Self {
+        Self {
+            parent: (0..edges).collect(),
+            size: vec![1; edges],
         }
-        index
     }
-    fn root(&mut self, mut i: usize) -> usize {
-        while self.parent[i] != i {
-            self.parent[i] = self.parent[self.parent[i]];
-            i = self.parent[i];
+
+    fn root(&mut self, mut edge: usize) -> usize {
+        while self.parent[edge] != edge {
+            self.parent[edge] = self.parent[self.parent[edge]];
+            edge = self.parent[edge];
         }
-        i
+        edge
     }
-    fn link(&mut self, left: &str, right: &str) {
-        let a = self.index(left);
-        let b = self.index(right);
-        let mut a = self.root(a);
-        let mut b = self.root(b);
+
+    fn join(&mut self, a: usize, b: usize) {
+        let (mut a, mut b) = (self.root(a), self.root(b));
         if a == b {
             return;
         }
@@ -130,7 +196,7 @@ pub(crate) fn direct_person(id: &str) -> Option<Person> {
 }
 
 pub struct People {
-    linked: Aliases,
+    linked: [Aliases; LINK_PARTS],
     names: Vec<Box<str>>,
     unlinked: [Mutex<Aliases>; SHARDS],
     hasher: RandomState,
@@ -162,38 +228,77 @@ pub(crate) fn with_direct_name<T>(person: Person, use_name: impl FnOnce(&str) ->
 
 impl People {
     pub fn read(folder: &Path) -> io::Result<Self> {
-        let mut groups = Groups::default();
-        for chunk in chunks(folder)? {
-            chunk.read(|line| {
-                if let Some([a, b]) = fields(line)
-                    && !a.is_empty()
-                    && !b.is_empty()
-                {
-                    groups.link(a, b);
-                }
-            })?;
-        }
-        Ok(Self::from_groups(groups))
+        let batches = chunks(folder)?
+            .par_iter()
+            .map(|chunk| {
+                let mut batch = LinkBatch::default();
+                chunk.read(|line| {
+                    if let Some([a, b]) = fields(line)
+                        && !a.is_empty()
+                        && !b.is_empty()
+                    {
+                        batch.link(a, b);
+                    }
+                })?;
+                Ok::<_, io::Error>(batch)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(Self::from_batches(batches))
     }
 
-    fn from_groups(mut groups: Groups) -> Self {
-        let mut linked = std::mem::take(&mut groups.ids);
-        let mut roots = vec![None; groups.parent.len()];
-        let mut names = Vec::new();
-        for (id, index) in linked.entries() {
-            let root = groups.root(*index);
-            let person = *roots[root].get_or_insert_with(|| {
-                names.push(id);
-                names.len() - 1
-            });
-            names[person] = names[person].min(id);
-            *index = person;
+    fn from_batches(batches: Vec<LinkBatch>) -> Self {
+        let mut partitions: [_; LINK_PARTS] = std::array::from_fn(|_| Vec::new());
+        let mut total = 0;
+        for batch in batches {
+            for (part, endpoints) in partitions.iter_mut().zip(batch.endpoints) {
+                part.push((total, endpoints));
+            }
+            total += batch.rows;
         }
-        let names: Vec<Box<str>> = names.into_iter().map(Box::from).collect();
+
+        // Every occurrence of an alias reaches the same partition, even across files.
+        let built: Vec<_> = partitions
+            .into_par_iter()
+            .map(index_link_partition)
+            .collect();
+
+        let mut forest = Forest::new(total);
+        let mut linked: Vec<_> = built
+            .into_iter()
+            .map(|(aliases, joins)| {
+                for (a, b) in joins {
+                    forest.join(a, b);
+                }
+                aliases
+            })
+            .collect();
+        let mut root_person = vec![usize::MAX; total];
+        let mut persons = 0;
+        let by_edge: Vec<_> = (0..total)
+            .map(|edge| {
+                let slot = &mut root_person[forest.root(edge)];
+                if *slot == usize::MAX {
+                    *slot = persons;
+                    persons += 1;
+                }
+                *slot
+            })
+            .collect();
+        let mut names = vec![""; persons];
+        for part in &mut linked {
+            for (id, edge) in part.entries() {
+                *edge = by_edge[*edge];
+                let smallest = &mut names[*edge];
+                if smallest.is_empty() || id < *smallest {
+                    *smallest = id;
+                }
+            }
+        }
+        let names = names.into_iter().map(Box::from).collect();
         Self {
-            next: AtomicUsize::new(names.len()),
-            linked,
+            linked: linked.try_into().unwrap_or_else(|_| unreachable!()),
             names,
+            next: AtomicUsize::new(persons),
             unlinked: std::array::from_fn(|_| Mutex::default()),
             hasher: RandomState::new(),
         }
@@ -201,7 +306,7 @@ impl People {
 
     pub fn resolve(&self, id: &str) -> Person {
         let key = Key::from(id);
-        if let Some(person) = self.linked.get(key) {
+        if let Some(person) = self.linked[link_part(id)].get(key) {
             return person;
         }
         if let Some(person) = direct_person(id) {
@@ -238,10 +343,10 @@ mod tests {
 
     #[test]
     fn concurrent_readers_share_numbers_and_preserve_output_names() {
-        let mut groups = Groups::default();
+        let mut groups = LinkBatch::default();
         groups.link("u12345678", "alias");
         groups.link("alias", " unseen");
-        let people = People::from_groups(groups);
+        let people = People::from_batches(vec![groups]);
         let input = ["alias", "u12345678", "é", "É", "é "];
         let workers = 8;
         let start = Barrier::new(workers);
@@ -269,9 +374,9 @@ mod tests {
 
     #[test]
     fn inline_names_round_trip_as_utf8_and_mix_with_text_aliases() {
-        let mut groups = Groups::default();
+        let mut groups = LinkBatch::default();
         groups.link("alias longer than nine bytes", "A12345678");
-        let people = People::from_groups(groups);
+        let people = People::from_batches(vec![groups]);
         let canonical = people.resolve("alias longer than nine bytes");
         assert_eq!(canonical, people.resolve("A12345678"));
         let inputs = ["é1234567", "É1234567", "é1234567 ", "a12345678"];
@@ -283,7 +388,7 @@ mod tests {
 
     #[test]
     fn direct_and_registered_names_remain_distinct() {
-        let people = People::from_groups(Groups::default());
+        let people = People::from_batches(vec![]);
         let inputs = [
             "u12345678",
             "U12345678",
@@ -303,5 +408,29 @@ mod tests {
         assert_eq!(people.resolve("\0u") & DIRECT, 0);
         let names = people.into_names();
         assert_eq!(ids.map(|id| names.with_name(id, str::to_owned)), inputs);
+    }
+
+    #[test]
+    fn transitive_linking_uses_the_smallest_original_name() {
+        let mut left = LinkBatch::default();
+        left.link(" z", "z");
+        left.link("B12345678", "bridge");
+        let mut right = LinkBatch::default();
+        right.link("z", "two devices");
+        right.link("two devices", "bridge");
+        right.link("bridge", "bridge");
+        right.link("B12345678", "bridge");
+        right.link("É", "é");
+        let people = People::from_batches(vec![left, LinkBatch::default(), right]);
+        let household = people.resolve("z");
+        for id in [" z", "two devices", "bridge", "B12345678"] {
+            assert_eq!(people.resolve(id), household);
+        }
+        let other = people.resolve("É");
+        assert_ne!(household, other);
+        assert_eq!(people.resolve("é"), other);
+        let names = people.into_names();
+        assert_eq!(names.with_name(household, str::to_owned), " z");
+        assert_eq!(names.with_name(other, str::to_owned), "É");
     }
 }

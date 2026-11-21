@@ -188,7 +188,7 @@ fn event_read(data: &Path, refs: &Lookups, shards: usize) -> io::Result<Vec<Even
         .par_iter()
         .map(|chunk| {
             let mut part = EventChunk::new(shards);
-            chunk.read_events(|row| {
+            chunk.read_fields::<7>(|row| {
                 if row[0].is_empty() {
                     return;
                 }
@@ -298,13 +298,11 @@ fn route_shoppers(
     out
 }
 
-fn finish(
-    mut scanned: Vec<EventChunk>,
-    groups: usize,
-    start: i64,
-    people: &People,
-) -> Batches<OwnedEvent> {
+pub struct WinningEvents(Vec<EventChunk>);
+
+pub fn read_winners(data: &Path, refs: &Lookups, groups: usize) -> Result<WinningEvents> {
     let shards = groups.next_power_of_two();
+    let mut scanned = event_read(data, refs, shards)?;
     let mut versions = buckets(shards);
     for (owner, part) in scanned.iter_mut().enumerate() {
         for (shard, bin) in std::mem::take(&mut part.versions).into_iter().enumerate() {
@@ -313,22 +311,23 @@ fn finish(
     }
     versions
         .into_par_iter()
-        .for_each(|bins| remove_duplicates(bins, &scanned, start));
-    let out = (0..shards)
-        .into_par_iter()
-        .map(|shard| route_shoppers(shard, &scanned, start, groups, |id| people.resolve(id)))
-        .collect();
-    regroup(out, groups)
+        .for_each(|bins| remove_duplicates(bins, &scanned, refs.start));
+    Ok(WinningEvents(scanned))
 }
 
-pub fn events(
-    data: &Path,
-    people: &People,
+pub fn route_winners(
+    winners: WinningEvents,
+    groups: usize,
     refs: &Lookups,
-    count: usize,
-) -> Result<Batches<OwnedEvent>> {
-    let scanned = event_read(data, refs, count.next_power_of_two())?;
-    Ok(finish(scanned, count, refs.start, people))
+    people: &People,
+) -> Batches<OwnedEvent> {
+    let scanned = winners.0;
+    let shards = groups.next_power_of_two();
+    let out = (0..shards)
+        .into_par_iter()
+        .map(|shard| route_shoppers(shard, &scanned, refs.start, groups, |id| people.resolve(id)))
+        .collect();
+    regroup(out, groups)
 }
 
 #[cfg(test)]

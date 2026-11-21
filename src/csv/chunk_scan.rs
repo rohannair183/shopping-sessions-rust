@@ -62,7 +62,7 @@ mod x86 {
     }
 }
 
-pub(super) fn visit(text: &str, visit_row: impl FnMut([&str; 7])) {
+pub(super) fn visit<const N: usize>(text: &str, visit_row: impl FnMut([&str; N])) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
@@ -75,9 +75,9 @@ pub(super) fn visit(text: &str, visit_row: impl FnMut([&str; 7])) {
     scan(text, classify, visit_row);
 }
 
-fn decode(line: &str, mut commas: u128, mut quotes: u128) -> Option<[&str; 7]> {
+fn decode<const N: usize>(line: &str, mut commas: u128, mut quotes: u128) -> Option<[&str; N]> {
     commas |= 1 << line.len();
-    let mut row = [""; 7];
+    let mut row = [""; N];
     let mut start = 0;
     for field in &mut row {
         if commas == 0 {
@@ -106,10 +106,10 @@ fn decode(line: &str, mut commas: u128, mut quotes: u128) -> Option<[&str; 7]> {
 
 // Each input block is classified once. Masks for an unfinished short row
 // carry into the next block. Long rows use the general parser on borrowed text.
-fn scan(
+fn scan<const N: usize>(
     text: &str,
     classify: impl Fn(&[u8; WIDTH]) -> Masks,
-    mut visit_row: impl FnMut([&str; 7]),
+    mut visit_row: impl FnMut([&str; N]),
 ) {
     let mut row_start = 0;
     let mut prior_commas = 0;

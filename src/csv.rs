@@ -145,7 +145,7 @@ impl Chunk {
         Ok(())
     }
 
-    pub fn read_events(&self, visit: impl FnMut([&str; 7])) -> io::Result<()> {
+    pub fn read_fields<const N: usize>(&self, visit: impl FnMut([&str; N])) -> io::Result<()> {
         let mut reader = BufReader::new(File::open(&self.path)?);
         let mut pos = self.start.saturating_sub(1);
         reader.seek(SeekFrom::Start(pos))?;
@@ -165,16 +165,16 @@ impl Chunk {
         }
         let text = std::str::from_utf8(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        event_scan::visit(text, visit);
+        chunk_scan::visit(text, visit);
         Ok(())
     }
 }
 
-mod event_scan;
+mod chunk_scan;
 
 #[cfg(test)]
 mod tests {
-    use super::{Chunk, event_scan, fields, split_fields};
+    use super::{Chunk, chunk_scan, fields, split_fields};
 
     #[test]
     fn event_masks_match_general_fields_at_block_and_row_edges() {
@@ -202,28 +202,26 @@ mod tests {
             .map(|row| row.map(str::to_owned))
             .collect();
         let mut actual = Vec::new();
-        event_scan::visit(&input, |row| actual.push(row.map(str::to_owned)));
+        chunk_scan::visit::<7>(&input, |row| actual.push(row.map(str::to_owned)));
         assert_eq!(expected, actual);
     }
 
-    #[test]
-    fn event_chunks_preserve_header_ownership_and_unterminated_tail() -> std::io::Result<()> {
+    fn check_chunk_splits<const N: usize>(input: &str) -> std::io::Result<()> {
         use std::{
             fs,
             time::{SystemTime, UNIX_EPOCH},
         };
-        let input = "h1,h2,h3,h4,h5,h6,h7\ne,u,1,2,view,p,\n\nq,\"日\",3,4,cart,\"p\",bad\r\ns,u,5,6,purchase,p,7\r";
         let salt = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("event-scan-{}-{salt}.csv", std::process::id()));
+            std::env::temp_dir().join(format!("chunk-scan-{}-{N}-{salt}.csv", std::process::id()));
         fs::write(&path, input)?;
         let expected: Vec<_> = input
             .split('\n')
             .skip(1)
-            .filter_map(split_fields::<7>)
+            .filter_map(split_fields::<N>)
             .map(|row| row.map(str::to_owned))
             .collect();
         for split in 0..=input.len() as u64 {
@@ -234,11 +232,26 @@ mod tests {
                     start,
                     end,
                 }
-                .read_events(|row| actual.push(row.map(str::to_owned)))?;
+                .read_fields::<N>(|row| actual.push(row.map(str::to_owned)))?;
             }
             assert_eq!(actual, expected, "split at byte {split}");
         }
         fs::remove_file(path)
+    }
+
+    #[test]
+    fn event_chunks_preserve_header_ownership_and_unterminated_tail() -> std::io::Result<()> {
+        let input = "h1,h2,h3,h4,h5,h6,h7\ne,u,1,2,view,p,\n\nq,\"日\",3,4,cart,\"p\",bad\r\ns,u,5,6,purchase,p,7\r";
+        check_chunk_splits::<7>(input)
+    }
+
+    #[test]
+    fn click_chunks_match_the_line_reader_at_every_split() -> std::io::Result<()> {
+        let long_id = "a".repeat(150);
+        let input = format!(
+            "id,user,campaign,ts\n\"c1\",é,ad,t\n\nc2,u,b\"ad,t\nc3,u,too,many,fields\n{long_id},u,ad,t\nc4,u,ad,end\r"
+        );
+        check_chunk_splits::<4>(&input)
     }
 
     #[test]

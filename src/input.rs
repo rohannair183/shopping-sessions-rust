@@ -204,7 +204,7 @@ fn regroup<T>(batches: Batches<T>, count: usize) -> Batches<T> {
 }
 
 mod grouped;
-pub use grouped::events;
+pub use grouped::{read_winners, route_winners};
 
 pub fn clicks(
     data: &Path,
@@ -216,10 +216,7 @@ pub fn clicks(
         .par_iter()
         .map(|chunk| {
             let mut out = buckets(count);
-            chunk.read(|line| {
-                let Some([id, user, camp, ts]) = fields(line) else {
-                    return;
-                };
+            chunk.read_fields(|[id, user, camp, ts]| {
                 if id.is_empty() || user.is_empty() {
                     return;
                 }

@@ -90,17 +90,18 @@ fn run() -> Result<()> {
     let groups = workers.checked_mul(4).ok_or("Too many workers")?;
     let user_folder = output_folder(&out, "user_daily")?;
     let campaign_folder = output_folder(&out, "campaign_daily")?;
-    let (people, refs) = rayon::join(
-        || identity::People::read(&data.join("links")),
-        || Lookups::read(&data),
-    );
-    let (people, refs) = (people?, refs?);
+    let refs = Lookups::read(&data)?;
     let read_start = Instant::now();
-    let (events, clicks) = rayon::join(
-        || input::events(&data, &people, &refs, groups),
-        || input::clicks(&data, &people, &refs, groups),
+    let (links_and_clicks, winners) = rayon::join(
+        || -> Result<_> {
+            let people = identity::People::read(&data.join("links"))?;
+            let clicks = input::clicks(&data, &people, &refs, groups)?;
+            Ok((people, clicks))
+        },
+        || input::read_winners(&data, &refs, groups),
     );
-    let (events, clicks) = (events?, clicks?);
+    let (people, clicks) = links_and_clicks?;
+    let events = input::route_winners(winners?, groups, &refs, &people);
     let names = people.into_names();
     let report_start = Instant::now();
     let parts: Vec<_> = events
